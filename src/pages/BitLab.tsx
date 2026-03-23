@@ -3,6 +3,7 @@ import TopBar from "@/components/TopBar";
 import SessionSidebar from "@/components/SessionSidebar";
 import CodeEditorPanel from "@/components/CodeEditorPanel";
 import OutputConsole from "@/components/OutputConsole";
+import type { SchemaTable } from "@/components/SchemaExplorer";
 
 export interface Session {
   id: string;
@@ -26,6 +27,7 @@ const BitLab = () => {
   const [bootVisible, setBootVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(200);
   const [outputWidth, setOutputWidth] = useState(340);
+  const [schemaTables, setSchemaTables] = useState<SchemaTable[]>([]);
 
   const activeSession = sessions.find((s) => s.id === activeId) || sessions[0];
 
@@ -60,11 +62,47 @@ const BitLab = () => {
     setMessages([]);
   };
 
+  const parseCreateTable = (code: string) => {
+    const regex = /CREATE\s+TABLE\s+(\w+)\s*\(([\s\S]*?)\)/gi;
+    let match;
+    const newTables: SchemaTable[] = [];
+    while ((match = regex.exec(code)) !== null) {
+      const tableName = match[1];
+      const colsRaw = match[2];
+      const columns = colsRaw
+        .split(",")
+        .map((c) => c.trim())
+        .filter(Boolean)
+        .map((c) => {
+          const parts = c.split(/\s+/);
+          return { name: parts[0] || "", type: parts.slice(1).join(" ").toUpperCase() || "UNKNOWN" };
+        });
+      newTables.push({ name: tableName, columns });
+    }
+    return newTables;
+  };
+
   const runQuery = () => {
     const code = activeSession.code.trim();
     if (!code) return;
 
-    // Fake output
+    // Check for CREATE TABLE and add to schema
+    const newTables = parseCreateTable(code);
+    if (newTables.length > 0) {
+      setSchemaTables((prev) => {
+        const existing = new Set(prev.map((t) => t.name));
+        const additions = newTables.filter((t) => !existing.has(t.name));
+        return [...prev, ...additions];
+      });
+      setOutput(null);
+      setMessages([
+        { type: "success", text: `Table(s) created: ${newTables.map((t) => t.name).join(", ")}` },
+        { type: "info", text: "Schema explorer updated." },
+      ]);
+      return;
+    }
+
+    // Fake SELECT output
     const table = `┌────────┬──────────────────┬───────┬───────────┐
 │ id     │ name             │ grade │ gpa       │
 ├────────┼──────────────────┼───────┼───────────┤
@@ -81,10 +119,7 @@ const BitLab = () => {
     ]);
   };
 
-  const handleResize = (
-    side: "left" | "right",
-    e: React.MouseEvent
-  ) => {
+  const handleResize = (side: "left" | "right", e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.clientX;
     const startWidth = side === "left" ? sidebarWidth : outputWidth;
@@ -107,13 +142,8 @@ const BitLab = () => {
 
   return (
     <div className="flex flex-col h-screen bg-background text-foreground overflow-hidden">
-      <TopBar
-        onDelete={deleteSession}
-        canDelete={sessions.length > 1}
-        bootVisible={bootVisible}
-      />
+      <TopBar onDelete={deleteSession} canDelete={sessions.length > 1} bootVisible={bootVisible} />
       <div className="flex flex-1 overflow-hidden">
-        {/* Sidebar */}
         <div style={{ width: sidebarWidth, minWidth: 140 }} className="flex-shrink-0">
           <SessionSidebar
             sessions={sessions}
@@ -121,14 +151,13 @@ const BitLab = () => {
             onSelect={setActiveId}
             onAdd={addSession}
             onRename={(id, name) => updateSession(id, { name })}
+            schemaTables={schemaTables}
           />
         </div>
-        {/* Left resize handle */}
         <div
           className="w-[2px] bg-panel-resize resize-handle cursor-col-resize flex-shrink-0"
           onMouseDown={(e) => handleResize("left", e)}
         />
-        {/* Center editor */}
         <div className="flex-1 min-w-0">
           <CodeEditorPanel
             session={activeSession}
@@ -139,12 +168,10 @@ const BitLab = () => {
             onSelectSession={setActiveId}
           />
         </div>
-        {/* Right resize handle */}
         <div
           className="w-[2px] bg-panel-resize resize-handle cursor-col-resize flex-shrink-0"
           onMouseDown={(e) => handleResize("right", e)}
         />
-        {/* Output panel */}
         <div style={{ width: outputWidth, minWidth: 240 }} className="flex-shrink-0">
           <OutputConsole
             output={output}
