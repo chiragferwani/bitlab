@@ -40,7 +40,7 @@ const SessionSidebar = ({ sessions, activeId, onSelect, onAdd, onRename, schemaT
           {sessions.map((session) => (
             <div
               key={session.id}
-              className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer transition-colors text-sm font-mono-code ${
+              className={`group flex items-center gap-2 px-3 py-1.5 cursor-pointer transition-colors text-sm font-mono-code ${
                 session.id === activeId
                   ? "bg-sidebar-accent text-sidebar-accent-foreground border-l-2 border-accent"
                   : "text-sidebar-foreground hover:bg-sidebar-accent/50 border-l-2 border-transparent"
@@ -62,7 +62,16 @@ const SessionSidebar = ({ sessions, activeId, onSelect, onAdd, onRename, schemaT
                   autoFocus
                 />
               ) : (
-                <span className="truncate text-xs">{session.name}</span>
+                <>
+                  <span className="truncate text-xs flex-1">{session.name}</span>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); startEdit(session); }}
+                    className="text-[10px] opacity-0 group-hover:opacity-50 hover:!opacity-100 text-muted-foreground hover:text-accent transition-opacity"
+                    title="Rename"
+                  >
+                    ✎
+                  </button>
+                </>
               )}
             </div>
           ))}

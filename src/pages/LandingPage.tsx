@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import bitlabLogo from "@/assets/bitlab_light.png";
 
 interface LandingPageProps {
   onEnter: () => void;
@@ -101,27 +102,30 @@ const LandingPage = ({ onEnter }: LandingPageProps) => {
 
       {/* Content */}
       <div className="relative z-10 flex flex-col items-center text-center px-6 max-w-2xl">
-        {/* Wordmark */}
-        <span className="font-mono-code font-bold text-sm tracking-[0.3em] text-accent mb-12 uppercase">
-          BitLab
-        </span>
+        {/* Logo + Wordmark */}
+        <div className="flex items-center gap-3 mb-14">
+          <img src={bitlabLogo} alt="BitLab logo" className="w-12 h-12" />
+          <span className="font-mono-code font-bold text-lg tracking-[0.3em] text-accent uppercase">
+            BitLab
+          </span>
+        </div>
 
         {/* Headline */}
-        <h1 className="font-mono-code text-3xl md:text-5xl font-bold leading-tight mb-6 text-foreground">
+        <h1 className="font-mono-code text-4xl md:text-6xl font-bold leading-tight mb-8 text-foreground">
           Write <span className="text-accent">SQL</span>. Run instantly.
           <br />
           <span className="text-accent">No servers</span>. No setup.
         </h1>
 
         {/* Subtext */}
-        <p className="font-ui text-base md:text-lg text-muted-foreground mb-10 max-w-md">
+        <p className="font-ui text-lg md:text-xl text-muted-foreground mb-12 max-w-lg">
           An offline SQL & PL/SQL compiler built for labs, learning, and speed.
         </p>
 
         {/* CTA */}
         <button
           onClick={handleEnter}
-          className="font-mono-code text-sm font-semibold px-6 py-3 border-2 border-accent text-accent hover:bg-accent hover:text-accent-foreground transition-all duration-200 tracking-wide"
+          className="font-mono-code text-base font-semibold px-8 py-4 border-2 border-accent text-accent hover:bg-accent hover:text-accent-foreground transition-all duration-200 tracking-wide"
         >
           Get Started →
         </button>
