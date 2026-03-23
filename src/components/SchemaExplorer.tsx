@@ -9,7 +9,7 @@ interface SchemaExplorerProps {
   tables: SchemaTable[];
 }
 
-const SchemaExplorer = ({ tables }: SchemaExplorerProps) => {
+const SchemaExplorer = ({ tables = [] }: SchemaExplorerProps) => {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const toggle = (name: string) => {
