@@ -1,3 +1,3 @@
-# Welcome to your Lovable project
+# BitLab
 
-TODO: Document your project here
+An offline SQL & PL/SQL compiler built for labs, learning, and speed.

@@ -1,5 +1,4 @@
 import { useState, useEffect } from "react";
-import bitlabLogo from "@/assets/bitlab_light.png";
 
 interface TopBarProps {
   onDelete: () => void;
@@ -20,14 +19,14 @@ const TopBar = ({ onDelete, canDelete, bootVisible }: TopBarProps) => {
   }, []);
 
   return (
-    <div className="h-10 flex items-center justify-between px-4 bg-card border-b border-border flex-shrink-0">
+    <div className="h-14 flex items-center justify-between px-4 bg-card border-b border-border flex-shrink-0">
       <div className="flex items-center gap-3">
-        <img src={bitlabLogo} alt="BitLab logo" className="w-6 h-6" />
-        <span className="font-mono-code font-bold text-sm tracking-wider text-accent">
+        <img src={isDark ? "/logo.png" : "/bitlab_light.png"} alt="BitLab logo" className="w-10 h-10" />
+        <span className="font-bold text-base tracking-wider text-accent">
           BitLab
         </span>
         {bootVisible && (
-          <span className="font-mono-code text-xs text-muted-foreground boot-message inline-block">
+          <span className="text-xs text-muted-foreground boot-message inline-block">
             v1.0 · SQL/PL·SQL Engine ready ✓
           </span>
         )}
@@ -35,19 +34,19 @@ const TopBar = ({ onDelete, canDelete, bootVisible }: TopBarProps) => {
       <div className="flex items-center gap-3">
         <button
           onClick={() => setIsDark(!isDark)}
-          className="font-mono-code text-xs text-muted-foreground hover:text-foreground transition-colors px-2 py-1"
+          className="text-xs text-muted-foreground hover:text-foreground transition-colors px-2 py-1"
         >
           {isDark ? "☀ Light" : "● Dark"}
         </button>
         {canDelete && (
           <button
             onClick={onDelete}
-            className="font-mono-code text-xs text-muted-foreground hover:text-destructive transition-colors px-2 py-1"
+            className="text-xs text-muted-foreground hover:text-destructive transition-colors px-2 py-1"
           >
             ✕ Delete Session
           </button>
         )}
-        <span className="font-mono-code text-xs text-muted-foreground">
+        <span className="text-xs text-muted-foreground">
           Ctrl+Enter to run
         </span>
       </div>

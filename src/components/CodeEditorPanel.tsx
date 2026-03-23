@@ -1,5 +1,7 @@
 import { useRef, useEffect, useState, useCallback } from "react";
 import type { Session } from "@/pages/BitLab";
+import Autocomplete from "./Autocomplete";
+import { detectMode } from "@/lib/keywords";
 
 interface CodeEditorPanelProps {
   session: Session;
@@ -8,6 +10,17 @@ interface CodeEditorPanelProps {
   onModeChange: (mode: "SQL" | "PL/SQL") => void;
   onRun: () => void;
   onSelectSession: (id: string) => void;
+}
+
+/**
+ * Gets the current word being typed at the cursor position.
+ */
+function getCurrentWord(text: string, cursorPos: number): { word: string; start: number } {
+  let start = cursorPos;
+  while (start > 0 && /[\w.]/.test(text[start - 1])) {
+    start--;
+  }
+  return { word: text.substring(start, cursorPos), start };
 }
 
 const CodeEditorPanel = ({
@@ -19,7 +32,15 @@ const CodeEditorPanel = ({
   onSelectSession,
 }: CodeEditorPanelProps) => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const editorContainerRef = useRef<HTMLDivElement>(null);
   const [cursorPos, setCursorPos] = useState({ line: 1, col: 1 });
+
+  // Autocomplete state
+  const [acVisible, setAcVisible] = useState(false);
+  const [acPrefix, setAcPrefix] = useState("");
+  const [acPosition, setAcPosition] = useState({ top: 0, left: 0 });
+  const [acIndex, setAcIndex] = useState(0);
+  const [acWordStart, setAcWordStart] = useState(0);
 
   const lines = session.code.split("\n");
   const lineCount = Math.max(lines.length, 20);
@@ -32,7 +53,63 @@ const CodeEditorPanel = ({
     const line = before.split("\n").length;
     const col = before.length - before.lastIndexOf("\n");
     setCursorPos({ line, col });
+
+    // Update autocomplete
+    const { word, start } = getCurrentWord(ta.value, ta.selectionStart);
+    if (word.length >= 2) {
+      setAcPrefix(word);
+      setAcWordStart(start);
+      setAcIndex(0);
+
+      // Calculate position for dropdown
+      const linesBefore = before.split("\n");
+      const currentLineNum = linesBefore.length;
+      const currentCol = linesBefore[linesBefore.length - 1].length;
+
+      // Approximate pixel position based on character metrics
+      const lineHeight = 19.2; // text-sm leading-[1.6] ≈ 14px * 1.6 = 22.4, but monospace is ~19.2
+      const charWidth = 8.4; // JetBrains Mono at 14px ≈ 8.4px per char
+      const lineNumWidth = 32; // line number gutter approximation
+
+      setAcPosition({
+        top: (currentLineNum) * lineHeight + 12, // +padding
+        left: lineNumWidth + (currentCol * charWidth) + 12,
+      });
+      setAcVisible(true);
+    } else {
+      setAcVisible(false);
+    }
   }, []);
+
+  const handleAcSelect = useCallback((word: string) => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+
+    const before = ta.value.substring(0, acWordStart);
+    const after = ta.value.substring(ta.selectionStart);
+    const newCode = before + word + " " + after;
+    onCodeChange(newCode);
+    setAcVisible(false);
+
+    // Restore focus and cursor position
+    requestAnimationFrame(() => {
+      ta.focus();
+      const newPos = acWordStart + word.length + 1;
+      ta.selectionStart = newPos;
+      ta.selectionEnd = newPos;
+    });
+  }, [acWordStart, onCodeChange]);
+
+  const handleCodeInput = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const newCode = e.target.value;
+    onCodeChange(newCode);
+
+    // Auto-detect mode reactively
+    const mode = detectMode(newCode);
+    if (mode !== session.mode) {
+      onModeChange(mode);
+    }
+  }, [onCodeChange, onModeChange, session.mode]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -67,7 +144,7 @@ const CodeEditorPanel = ({
       )}
 
       {/* Editor area */}
-      <div className="flex flex-1 overflow-hidden relative">
+      <div ref={editorContainerRef} className="flex flex-1 overflow-hidden relative">
         {/* Line numbers */}
         <div className="flex flex-col items-end py-3 px-2 select-none bg-editor-bg border-r border-border/50 overflow-hidden flex-shrink-0">
           {Array.from({ length: lineCount }, (_, i) => (
@@ -84,7 +161,7 @@ const CodeEditorPanel = ({
         <textarea
           ref={textareaRef}
           value={session.code}
-          onChange={(e) => onCodeChange(e.target.value)}
+          onChange={handleCodeInput}
           onKeyUp={updateCursor}
           onClick={updateCursor}
           spellCheck={false}
@@ -101,17 +178,25 @@ const CodeEditorPanel = ({
         >
           Run ▶
         </button>
+
+        {/* Autocomplete dropdown */}
+        <Autocomplete
+          prefix={acPrefix}
+          position={acPosition}
+          visible={acVisible}
+          selectedIndex={acIndex}
+          onSelect={handleAcSelect}
+          onIndexChange={setAcIndex}
+          onDismiss={() => setAcVisible(false)}
+        />
       </div>
 
       {/* Status bar */}
       <div className="flex items-center justify-between px-3 h-6 bg-status-bar border-t border-border text-[10px] font-mono-code text-muted-foreground flex-shrink-0">
         <div className="flex items-center gap-4">
-          <button
-            onClick={() => onModeChange(session.mode === "SQL" ? "PL/SQL" : "SQL")}
-            className="hover:text-accent transition-colors"
-          >
+          <span className="hover:text-accent transition-colors">
             {session.mode}
-          </button>
+          </span>
           <span>
             Ln {cursorPos.line}, Col {cursorPos.col}
           </span>

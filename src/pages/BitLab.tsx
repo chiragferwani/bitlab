@@ -1,9 +1,15 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import type { Database } from "sql.js";
 import TopBar from "@/components/TopBar";
 import SessionSidebar from "@/components/SessionSidebar";
 import CodeEditorPanel from "@/components/CodeEditorPanel";
 import OutputConsole from "@/components/OutputConsole";
 import type { SchemaTable } from "@/components/SchemaExplorer";
+import { initDatabase, createDatabase, introspectSchema } from "@/lib/database";
+import { executeSQL } from "@/lib/sqlEngine";
+import { executePLSQL } from "@/lib/plsqlInterpreter";
+import { detectMode } from "@/lib/keywords";
+import { formatCsv } from "@/lib/tableFormatter";
 
 export interface Session {
   id: string;
@@ -15,7 +21,7 @@ export interface Session {
 const defaultSession: Session = {
   id: "1",
   name: "query_01.sql",
-  code: "SELECT * FROM students\nWHERE grade >= 'B'\nORDER BY name ASC;",
+  code: "",
   mode: "SQL",
 };
 
@@ -28,8 +34,33 @@ const BitLab = () => {
   const [sidebarWidth, setSidebarWidth] = useState(200);
   const [outputWidth, setOutputWidth] = useState(340);
   const [schemaTables, setSchemaTables] = useState<SchemaTable[]>([]);
+  const [dbReady, setDbReady] = useState(false);
+
+  // Per-session database instances
+  const dbMapRef = useRef<Map<string, Database>>(new Map());
+  // Per-session stored procedures/functions
+  const procsMapRef = useRef<Map<string, Map<string, any>>>(new Map());
+  // Raw result for CSV export
+  const [rawResult, setRawResult] = useState<{ columns: string[]; rows: string[][] } | null>(null);
 
   const activeSession = sessions.find((s) => s.id === activeId) || sessions[0];
+
+  // Initialize sql.js on mount
+  useEffect(() => {
+    initDatabase()
+      .then(() => {
+        // Create DB for default session
+        const db = createDatabase();
+        dbMapRef.current.set("1", db);
+        procsMapRef.current.set("1", new Map());
+        setDbReady(true);
+        console.log("[BitLab] sql.js initialized, database ready.");
+      })
+      .catch((err) => {
+        console.error("[BitLab] Failed to initialize sql.js:", err);
+        setMessages([{ type: "error", text: `Failed to load SQL engine: ${err.message}` }]);
+      });
+  }, []);
 
   useEffect(() => {
     const timer = setTimeout(() => setBootVisible(false), 4000);
@@ -41,6 +72,7 @@ const BitLab = () => {
   };
 
   const addSession = () => {
+    if (!dbReady) return;
     const newId = String(Date.now());
     const num = sessions.length + 1;
     const newSession: Session = {
@@ -49,75 +81,116 @@ const BitLab = () => {
       code: "",
       mode: "SQL",
     };
+    // Create isolated DB for this session
+    const db = createDatabase();
+    dbMapRef.current.set(newId, db);
+    procsMapRef.current.set(newId, new Map());
     setSessions((prev) => [...prev, newSession]);
     setActiveId(newId);
   };
 
   const deleteSession = () => {
     if (sessions.length <= 1) return;
+    // Close the DB for the deleted session
+    const db = dbMapRef.current.get(activeId);
+    if (db) {
+      try { db.close(); } catch { /* ignore */ }
+      dbMapRef.current.delete(activeId);
+    }
+    procsMapRef.current.delete(activeId);
     const remaining = sessions.filter((s) => s.id !== activeId);
     setSessions(remaining);
     setActiveId(remaining[0].id);
     setOutput(null);
     setMessages([]);
+    setRawResult(null);
+    // Refresh schema for the new active session
+    refreshSchema(remaining[0].id);
   };
 
-  const parseCreateTable = (code: string) => {
-    const regex = /CREATE\s+TABLE\s+(\w+)\s*\(([\s\S]*?)\)/gi;
-    let match;
-    const newTables: SchemaTable[] = [];
-    while ((match = regex.exec(code)) !== null) {
-      const tableName = match[1];
-      const colsRaw = match[2];
-      const columns = colsRaw
-        .split(",")
-        .map((c) => c.trim())
-        .filter(Boolean)
-        .map((c) => {
-          const parts = c.split(/\s+/);
-          return { name: parts[0] || "", type: parts.slice(1).join(" ").toUpperCase() || "UNKNOWN" };
-        });
-      newTables.push({ name: tableName, columns });
+  const refreshSchema = (sessionId: string) => {
+    const db = dbMapRef.current.get(sessionId);
+    if (db) {
+      const schema = introspectSchema(db);
+      setSchemaTables(schema);
+    } else {
+      setSchemaTables([]);
     }
-    return newTables;
   };
 
-  const runQuery = () => {
-    const code = activeSession.code.trim();
+  const handleSelectSession = useCallback((id: string) => {
+    setActiveId(id);
+    setOutput(null);
+    setMessages([]);
+    setRawResult(null);
+    // Refresh schema for the selected session
+    refreshSchema(id);
+  }, []);
+
+  const handleCodeChange = useCallback((code: string) => {
+    updateSession(activeId, { code });
+    // Auto-detect mode
+    const mode = detectMode(code);
+    updateSession(activeId, { code, mode });
+  }, [activeId]);
+
+  const runQuery = useCallback(() => {
+    const session = sessions.find((s) => s.id === activeId);
+    if (!session) return;
+    const code = session.code.trim();
     if (!code) return;
 
-    // Check for CREATE TABLE and add to schema
-    const newTables = parseCreateTable(code);
-    if (newTables.length > 0) {
-      setSchemaTables((prev) => {
-        const existing = new Set(prev.map((t) => t.name));
-        const additions = newTables.filter((t) => !existing.has(t.name));
-        return [...prev, ...additions];
-      });
-      setOutput(null);
-      setMessages([
-        { type: "success", text: `Table(s) created: ${newTables.map((t) => t.name).join(", ")}` },
-        { type: "info", text: "Schema explorer updated." },
-      ]);
+    const db = dbMapRef.current.get(activeId);
+    if (!db) {
+      setMessages([{ type: "error", text: "Database not initialized for this session." }]);
       return;
     }
 
-    // Fake SELECT output
-    const table = `┌────────┬──────────────────┬───────┬───────────┐
-│ id     │ name             │ grade │ gpa       │
-├────────┼──────────────────┼───────┼───────────┤
-│ 1001   │ Alice Johnson    │ A     │ 3.92      │
-│ 1002   │ Bob Martinez     │ B+    │ 3.45      │
-│ 1003   │ Carol Wu         │ A-    │ 3.78      │
-│ 1004   │ David Chen       │ B     │ 3.21      │
-└────────┴──────────────────┴───────┴───────────┘`;
-    setOutput(table);
-    setMessages([
-      { type: "success", text: "Query executed successfully." },
-      { type: "info", text: "4 rows returned in 0.023s" },
-      { type: "info", text: "DBMS_OUTPUT: Execution complete." },
-    ]);
-  };
+    const mode = detectMode(code);
+
+    if (mode === "PL/SQL") {
+      // PL/SQL execution
+      const procs = procsMapRef.current.get(activeId) || new Map();
+      const result = executePLSQL(db, code, procs);
+      procsMapRef.current.set(activeId, procs);
+
+      // Display DBMS_OUTPUT lines in the output panel
+      if (result.output.length > 0) {
+        setOutput("DBMS_OUTPUT:\n" + result.output.join("\n"));
+      } else {
+        setOutput(null);
+      }
+      setRawResult(null);
+      setMessages((prev) => [...prev, ...result.messages]);
+    } else {
+      // SQL execution
+      const result = executeSQL(db, code);
+      setOutput(result.output);
+      setRawResult(result.rawResult);
+      setMessages((prev) => [...prev, ...result.messages]);
+    }
+
+    // Refresh schema after execution
+    refreshSchema(activeId);
+  }, [sessions, activeId]);
+
+  const handleClear = useCallback(() => {
+    setOutput(null);
+    setMessages([]);
+    setRawResult(null);
+  }, []);
+
+  const handleExportCsv = useCallback(() => {
+    if (!rawResult) return;
+    const csv = formatCsv(rawResult.columns, rawResult.rows);
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "output.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [rawResult]);
 
   const handleResize = (side: "left" | "right", e: React.MouseEvent) => {
     e.preventDefault();
@@ -148,7 +221,7 @@ const BitLab = () => {
           <SessionSidebar
             sessions={sessions}
             activeId={activeId}
-            onSelect={setActiveId}
+            onSelect={handleSelectSession}
             onAdd={addSession}
             onRename={(id, name) => updateSession(id, { name })}
             schemaTables={schemaTables}
@@ -162,10 +235,10 @@ const BitLab = () => {
           <CodeEditorPanel
             session={activeSession}
             sessions={sessions}
-            onCodeChange={(code) => updateSession(activeId, { code })}
+            onCodeChange={handleCodeChange}
             onModeChange={(mode) => updateSession(activeId, { mode })}
             onRun={runQuery}
-            onSelectSession={setActiveId}
+            onSelectSession={handleSelectSession}
           />
         </div>
         <div
@@ -176,7 +249,9 @@ const BitLab = () => {
           <OutputConsole
             output={output}
             messages={messages}
-            onClear={() => { setOutput(null); setMessages([]); }}
+            onClear={handleClear}
+            onExportCsv={handleExportCsv}
+            hasRawResult={rawResult !== null}
           />
         </div>
       </div>
