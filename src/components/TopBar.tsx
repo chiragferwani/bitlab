@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import bitlabLogo from "@/assets/bitlab_light.png";
 
 interface TopBarProps {
   onDelete: () => void;
@@ -21,6 +22,7 @@ const TopBar = ({ onDelete, canDelete, bootVisible }: TopBarProps) => {
   return (
     <div className="h-10 flex items-center justify-between px-4 bg-card border-b border-border flex-shrink-0">
       <div className="flex items-center gap-3">
+        <img src={bitlabLogo} alt="BitLab logo" className="w-6 h-6" />
         <span className="font-mono-code font-bold text-sm tracking-wider text-accent">
           BitLab
         </span>
