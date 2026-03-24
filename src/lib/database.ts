@@ -16,7 +16,12 @@ let SQL: SqlJsStatic | null = null;
 export async function initDatabase(): Promise<void> {
   if (SQL) return;
   SQL = await initSqlJs({
-    locateFile: () => `/sql-wasm.wasm`,
+    locateFile: (file) => {
+      if (typeof window !== "undefined" && window.location.protocol === "file:") {
+        return new URL(`./${file}`, window.location.href).toString();
+      }
+      return `/${file}`;
+    },
   });
 }
 

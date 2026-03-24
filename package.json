@@ -1,12 +1,23 @@
 {
   "name": "vite_react_shadcn_ts",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
+  "description": "BitLab offline SQL and PL/SQL desktop app",
+  "author": {
+    "name": "BitLab Team",
+    "email": "support@bitlab.app"
+  },
   "type": "module",
+  "main": "electron/main.js",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "build:dev": "vite build --mode development",
+    "electron:dev": "concurrently -k \"npm:dev\" \"wait-on http://localhost:5173 && cross-env ELECTRON_DEV_URL=http://localhost:5173 electron .\"",
+    "electron:build": "vite build && electron-builder",
+    "dist:win": "vite build && electron-builder --win",
+    "dist:linux": "vite build && electron-builder --linux",
+    "dist:mac": "vite build && electron-builder --mac",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",
@@ -67,6 +78,8 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.32.0",
+    "@fontsource/inter": "^5.2.8",
+    "@fontsource/jetbrains-mono": "^5.2.8",
     "@playwright/test": "^1.57.0",
     "@tailwindcss/typography": "^0.5.16",
     "@testing-library/jest-dom": "^6.6.0",
@@ -76,6 +89,10 @@
     "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react-swc": "^3.11.0",
     "autoprefixer": "^10.4.21",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^41.0.3",
+    "electron-builder": "^26.8.1",
     "eslint": "^9.32.0",
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.20",
@@ -86,6 +103,75 @@
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.38.0",
     "vite": "^5.4.19",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "wait-on": "^9.0.4"
+  },
+  "build": {
+    "appId": "com.bitlab.app",
+    "productName": "BitLab",
+    "copyright": "Copyright \u00a9 2026",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "assets/icons/**/*",
+      "node_modules/sql.js/dist/sql-wasm.wasm"
+    ],
+    "extraResources": [
+      {
+        "from": "public/sql-wasm.wasm",
+        "to": "sql-wasm.wasm"
+      }
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "icon": "assets/icons/icon.ico",
+      "artifactName": "BitLab-${version}-windows.${ext}",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "BitLab"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "assets/icons/icon.png",
+      "category": "Development",
+      "artifactName": "BitLab-${version}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "assets/icons/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "artifactName": "BitLab-${version}.${ext}"
+    },
+    "dmg": {
+      "title": "BitLab Installer",
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    }
   }
 }
