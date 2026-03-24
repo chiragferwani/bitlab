@@ -35,6 +35,7 @@ interface CursorDef {
   columns: string[] | null;
   position: number;
   isOpen: boolean;
+  lastFetchFound: boolean;
 }
 
 interface StoredProgram {
@@ -140,8 +141,8 @@ function evaluateExpression(expr: string, ctx: ExecutionContext): unknown {
     const cursor = ctx.cursors.get(cursorName);
     if (!cursor) return null;
     switch (attr) {
-      case "NOTFOUND": return cursor.rows === null || cursor.position >= cursor.rows.length;
-      case "FOUND": return cursor.rows !== null && cursor.position < cursor.rows.length;
+      case "NOTFOUND": return cursor.isOpen && !cursor.lastFetchFound;
+      case "FOUND": return cursor.isOpen && cursor.lastFetchFound;
       case "ROWCOUNT": return cursor.position;
       case "ISOPEN": return cursor.isOpen;
     }
@@ -394,20 +395,46 @@ function collectBlock(lines: string[], startIdx: number, endKeyword: RegExp): { 
 
 function parseDeclareSection(lines: string[], ctx: ExecutionContext) {
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim().replace(/;$/, "").trim();
+    const raw = lines[i].trim();
+    const line = raw.replace(/;$/, "").trim();
     if (!line || line.toUpperCase() === "DECLARE") continue;
 
     // Cursor declaration: CURSOR c1 IS SELECT ...
-    const cursorMatch = line.match(/^CURSOR\s+(\w+)\s+IS\s+(.*)/i);
+    const cursorMatch = raw.match(/^CURSOR\s+(\w+)\s+IS\b([\s\S]*)$/i);
     if (cursorMatch) {
-      ctx.cursors.set(cursorMatch[1].toUpperCase(), {
-        name: cursorMatch[1].toUpperCase(),
-        query: cursorMatch[2],
+      const cursorName = cursorMatch[1].toUpperCase();
+      const queryParts: string[] = [];
+      let j = i;
+
+      const firstTail = (cursorMatch[2] || "").trim().replace(/;$/, "");
+      if (firstTail) {
+        queryParts.push(firstTail);
+      }
+
+      if (!raw.endsWith(";")) {
+        j = i + 1;
+        while (j < lines.length) {
+          const partRaw = lines[j].trim();
+          if (!partRaw) {
+            j++;
+            continue;
+          }
+          queryParts.push(partRaw.replace(/;$/, "").trim());
+          if (partRaw.endsWith(";")) break;
+          j++;
+        }
+      }
+
+      ctx.cursors.set(cursorName, {
+        name: cursorName,
+        query: queryParts.join(" ").trim(),
         rows: null,
         columns: null,
         position: 0,
         isOpen: false,
+        lastFetchFound: false,
       });
+      i = j;
       continue;
     }
 
@@ -562,6 +589,7 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
           }
           cursor.position = 0;
           cursor.isOpen = true;
+          cursor.lastFetchFound = false;
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           throw new Error(`Line ${currentLineNo}: ${toOracleErrorText(msg)}`);
@@ -583,9 +611,11 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
           ctx.setVar(varNames[j], row[j] === null ? null : row[j]);
         }
         cursor.position++;
+        cursor.lastFetchFound = true;
       } else if (cursor) {
         // Past end — mark as NOTFOUND (position stays beyond length)
         if (cursor.rows) cursor.position = cursor.rows.length;
+        cursor.lastFetchFound = false;
       }
       i++;
       continue;
@@ -599,6 +629,7 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
         cursor.isOpen = false;
         cursor.rows = null;
         cursor.position = 0;
+        cursor.lastFetchFound = false;
       }
       i++;
       continue;
@@ -641,7 +672,7 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
         // Resolve variables in the DML statement
         let query = merged.statement;
         for (const [varName, variable] of ctx.variables) {
-          const re = new RegExp(`\\b${varName}\\b`, "g");
+          const re = new RegExp(`\\b${varName}\\b`, "gi");
           if (typeof variable.value === "string") {
             query = query.replace(re, `'${variable.value}'`);
           } else if (variable.value !== null && variable.value !== undefined) {
