@@ -26,7 +26,9 @@ export async function initDatabase(): Promise<void> {
  */
 export function createDatabase(): Database {
   if (!SQL) throw new Error("sql.js not initialized. Call initDatabase() first.");
-  return new SQL.Database();
+  const db = new SQL.Database();
+  db.run("PRAGMA foreign_keys = ON");
+  return db;
 }
 
 /**

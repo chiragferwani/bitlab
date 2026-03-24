@@ -134,10 +134,10 @@ const BitLab = () => {
     updateSession(activeId, { code, mode });
   }, [activeId]);
 
-  const runQuery = useCallback(() => {
+  const runQuery = useCallback((codeOverride?: string) => {
     const session = sessions.find((s) => s.id === activeId);
     if (!session) return;
-    const code = session.code.trim();
+    const code = (codeOverride ?? session.code).trim();
     if (!code) return;
 
     const db = dbMapRef.current.get(activeId);
@@ -148,30 +148,36 @@ const BitLab = () => {
 
     const mode = detectMode(code);
 
-    if (mode === "PL/SQL") {
-      // PL/SQL execution
-      const procs = procsMapRef.current.get(activeId) || new Map();
-      const result = executePLSQL(db, code, procs);
-      procsMapRef.current.set(activeId, procs);
+    try {
+      if (mode === "PL/SQL") {
+        // PL/SQL execution
+        const procs = procsMapRef.current.get(activeId) || new Map();
+        const result = executePLSQL(db, code, procs);
+        procsMapRef.current.set(activeId, procs);
 
-      // Display DBMS_OUTPUT lines in the output panel
-      if (result.output.length > 0) {
-        setOutput("DBMS_OUTPUT:\n" + result.output.join("\n"));
+        if (result.sqlOutput) {
+          setOutput(result.sqlOutput);
+          setRawResult(result.rawResult ?? null);
+        } else if (result.output.length > 0) {
+          // Display DBMS_OUTPUT lines in the output panel when no SQL result set exists
+          setOutput("DBMS_OUTPUT:\n" + result.output.join("\n"));
+          setRawResult(null);
+        } else {
+          setOutput(null);
+          setRawResult(null);
+        }
+        setMessages((prev) => [...prev, ...result.messages]);
       } else {
-        setOutput(null);
+        // SQL execution
+        const result = executeSQL(db, code, { sessionName: session.name });
+        setOutput(result.output);
+        setRawResult(result.rawResult);
+        setMessages((prev) => [...prev, ...result.messages]);
       }
-      setRawResult(null);
-      setMessages((prev) => [...prev, ...result.messages]);
-    } else {
-      // SQL execution
-      const result = executeSQL(db, code);
-      setOutput(result.output);
-      setRawResult(result.rawResult);
-      setMessages((prev) => [...prev, ...result.messages]);
+    } finally {
+      // Refresh schema after every execution batch, even when statements error
+      refreshSchema(activeId);
     }
-
-    // Refresh schema after execution
-    refreshSchema(activeId);
   }, [sessions, activeId]);
 
   const handleClear = useCallback(() => {
@@ -239,6 +245,8 @@ const BitLab = () => {
             onModeChange={(mode) => updateSession(activeId, { mode })}
             onRun={runQuery}
             onSelectSession={handleSelectSession}
+            messages={messages}
+            output={output}
           />
         </div>
         <div
@@ -248,7 +256,6 @@ const BitLab = () => {
         <div style={{ width: outputWidth, minWidth: 240 }} className="flex-shrink-0">
           <OutputConsole
             output={output}
-            messages={messages}
             onClear={handleClear}
             onExportCsv={handleExportCsv}
             hasRawResult={rawResult !== null}

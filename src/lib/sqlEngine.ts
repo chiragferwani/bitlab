@@ -8,7 +8,7 @@ import type { Database } from "sql.js";
 import { mapSqliteError } from "./oracleErrors";
 import { formatTable } from "./tableFormatter";
 
-/** Message displayed in the MESSAGES panel */
+/** Message displayed in the inline message panel */
 export interface OutputMessage {
   type: "success" | "error" | "info";
   text: string;
@@ -22,6 +22,86 @@ export interface ExecutionResult {
   rawResult: { columns: string[]; rows: string[][] } | null;
   /** Messages to display */
   messages: OutputMessage[];
+}
+
+type SyntheticStatementResult =
+  | {
+      kind: "message";
+      message: OutputMessage;
+    }
+  | {
+      kind: "table";
+      message?: OutputMessage;
+      columns: string[];
+      rows: string[][];
+    };
+
+interface ExecuteSQLOptions {
+  sessionName?: string;
+  lineOffset?: number;
+}
+
+interface ParsedStatement {
+  text: string;
+  line: number;
+}
+
+/**
+ * Translates common Oracle SQL expressions to SQLite-compatible SQL.
+ */
+export function translateOracleSql(sql: string): string {
+  return sql
+    .replace(/\bSYSDATE\s*-\s*(\d+)\b/gi, "DATE('now', '-$1 day')")
+    .replace(/\bSYSDATE\s*\+\s*(\d+)\b/gi, "DATE('now', '+$1 day')")
+    .replace(/\bSYSDATE\b/gi, "DATE('now')");
+}
+
+/**
+ * Normalizes SQL text copied from rich editors by replacing hidden spacing chars
+ * (NBSP, thin space, zero-width chars) outside quoted strings.
+ */
+function normalizeSqlText(code: string): string {
+  const normalizedLineEndings = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  let result = "";
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+
+  for (let i = 0; i < normalizedLineEndings.length; i++) {
+    const ch = normalizedLineEndings[i];
+
+    if (ch === "'" && !inDoubleQuote) {
+      if (inSingleQuote && i + 1 < normalizedLineEndings.length && normalizedLineEndings[i + 1] === "'") {
+        result += "''";
+        i++;
+        continue;
+      }
+      inSingleQuote = !inSingleQuote;
+      result += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      result += ch;
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote) {
+      if (ch === "\u00A0" || ch === "\u2007" || ch === "\u202F") {
+        result += " ";
+        continue;
+      }
+      if (
+        ch === "\u200B" || ch === "\u200C" || ch === "\u200D" ||
+        ch === "\u2060" || ch === "\uFEFF"
+      ) {
+        continue;
+      }
+    }
+
+    result += ch;
+  }
+
+  return result;
 }
 
 /**
@@ -44,20 +124,30 @@ function classifyStatement(sql: string): string {
 
 /**
  * Splits SQL code into individual statements by semicolons.
- * Handles basic string literal awareness to avoid splitting inside quotes.
+ * Ignores semicolons inside single/double quoted strings and BEGIN...END blocks.
  */
-function splitStatements(code: string): string[] {
-  const statements: string[] = [];
+function splitStatements(code: string): ParsedStatement[] {
+  const normalized = normalizeSqlText(code);
+  const statements: ParsedStatement[] = [];
   let current = "";
   let inSingleQuote = false;
   let inDoubleQuote = false;
+  let blockDepth = 0;
+  let line = 1;
+  let statementStartLine = 1;
+  let seenNonWhitespace = false;
 
-  for (let i = 0; i < code.length; i++) {
-    const ch = code[i];
+  for (let i = 0; i < normalized.length; i++) {
+    const ch = normalized[i];
+
+    if (!seenNonWhitespace && !/\s/.test(ch)) {
+      statementStartLine = line;
+      seenNonWhitespace = true;
+    }
 
     if (ch === "'" && !inDoubleQuote) {
       // Check for escaped quote ''
-      if (inSingleQuote && i + 1 < code.length && code[i + 1] === "'") {
+      if (inSingleQuote && i + 1 < normalized.length && normalized[i + 1] === "'") {
         current += "''";
         i++;
         continue;
@@ -67,19 +157,121 @@ function splitStatements(code: string): string[] {
       inDoubleQuote = !inDoubleQuote;
     }
 
-    if (ch === ";" && !inSingleQuote && !inDoubleQuote) {
+    if (!inSingleQuote && !inDoubleQuote && /[A-Za-z_]/.test(ch)) {
+      let j = i;
+      while (j < normalized.length && /[A-Za-z0-9_$]/.test(normalized[j])) j++;
+      const token = normalized.slice(i, j).toUpperCase();
+      if (token === "BEGIN") {
+        blockDepth++;
+      } else if (token === "END" && blockDepth > 0) {
+        blockDepth--;
+      }
+      current += normalized.slice(i, j);
+      i = j - 1;
+      continue;
+    }
+
+    if (ch === ";" && !inSingleQuote && !inDoubleQuote && blockDepth === 0) {
       const trimmed = current.trim();
-      if (trimmed) statements.push(trimmed);
+      if (trimmed) {
+        statements.push({ text: trimmed, line: statementStartLine });
+      }
       current = "";
+      seenNonWhitespace = false;
     } else {
       current += ch;
     }
+
+    if (ch === "\n") line++;
   }
 
   const remaining = current.trim();
-  if (remaining) statements.push(remaining);
+  if (remaining) {
+    statements.push({ text: remaining, line: seenNonWhitespace ? statementStartLine : line });
+  }
 
   return statements;
+}
+
+function stripIdentifierQuotes(value: string): string {
+  return value.replace(/^["'`]|["'`]$/g, "");
+}
+
+function preprocessStatement(db: Database, statement: string, sessionName: string): SyntheticStatementResult | null {
+  const trimmed = statement.trim().replace(/;+\s*$/, "");
+
+  const createDbMatch = trimmed.match(/^CREATE\s+DATABASE\s+([`"']?[\w$]+[`"']?)$/i);
+  if (createDbMatch) {
+    const name = stripIdentifierQuotes(createDbMatch[1]);
+    return {
+      kind: "message",
+      message: {
+        type: "info",
+        text: `Database "${name}" created. (BitLab uses per-session databases automatically)`,
+      },
+    };
+  }
+
+  const dropDbMatch = trimmed.match(/^DROP\s+DATABASE\s+([`"']?[\w$]+[`"']?)$/i);
+  if (dropDbMatch) {
+    const name = stripIdentifierQuotes(dropDbMatch[1]);
+    return {
+      kind: "message",
+      message: { type: "info", text: `Database "${name}" dropped.` },
+    };
+  }
+
+  const useDbMatch = trimmed.match(/^USE\s+([`"']?[\w$]+[`"']?)$/i);
+  if (useDbMatch) {
+    const name = stripIdentifierQuotes(useDbMatch[1]);
+    return {
+      kind: "message",
+      message: {
+        type: "info",
+        text: `Database context switched to "${name}". (Session is already active)`,
+      },
+    };
+  }
+
+  if (/^SHOW\s+DATABASES$/i.test(trimmed)) {
+    return {
+      kind: "table",
+      columns: ["Database"],
+      rows: [[sessionName]],
+      message: { type: "success", text: "1 row returned." },
+    };
+  }
+
+  if (/^SHOW\s+TABLES$/i.test(trimmed)) {
+    const results = db.exec(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    );
+    const rows = results.length > 0 ? results[0].values.map((r) => [String(r[0])]) : [];
+    return {
+      kind: "table",
+      columns: ["Tables"],
+      rows,
+      message: { type: "success", text: `${rows.length} row${rows.length !== 1 ? "s" : ""} returned.` },
+    };
+  }
+
+  if (/^ALTER\s+USER\b/i.test(trimmed)) {
+    return { kind: "message", message: { type: "success", text: "User altered." } };
+  }
+
+  if (/^GRANT\b/i.test(trimmed)) {
+    return { kind: "message", message: { type: "success", text: "Grant succeeded." } };
+  }
+
+  if (/^REVOKE\b/i.test(trimmed)) {
+    return { kind: "message", message: { type: "success", text: "Revoke succeeded." } };
+  }
+
+  if (/^CONNECT\b/i.test(trimmed)) {
+    return { kind: "message", message: { type: "success", text: "Connected." } };
+  }
+
+  return null;
 }
 
 /**
@@ -94,10 +286,12 @@ function timeStamp(): string {
  * Executes SQL code against the given database.
  * Returns structured results for UI rendering.
  */
-export function executeSQL(db: Database, code: string): ExecutionResult {
+export function executeSQL(db: Database, code: string, options: ExecuteSQLOptions = {}): ExecutionResult {
   const messages: OutputMessage[] = [];
   let output: string | null = null;
   let rawResult: { columns: string[]; rows: string[][] } | null = null;
+  const sessionName = options.sessionName || "session";
+  const lineOffset = options.lineOffset || 0;
 
   // Run separator
   messages.push({ type: "info", text: `── Run at ${timeStamp()} ──` });
@@ -105,38 +299,40 @@ export function executeSQL(db: Database, code: string): ExecutionResult {
   const statements = splitStatements(code);
 
   if (statements.length === 0) {
-    messages.push({ type: "info", text: "No statements to execute." });
+    if (messages.length === 1) { // Only run separator
+      messages.push({ type: "info", text: "No statements to execute." });
+    }
     return { output, rawResult, messages };
   }
 
   const startTime = performance.now();
-  let totalRows = 0;
   let lastSelectOutput: string | null = null;
   let lastRawResult: { columns: string[]; rows: string[][] } | null = null;
 
-  for (const stmt of statements) {
+  for (const parsed of statements) {
+    const stmt = parsed.text;
+    const lineNo = parsed.line;
+    const upperStmt = stmt.trim().toUpperCase();
     try {
-      const upperStmt = stmt.trim().toUpperCase();
+      const synthetic = preprocessStatement(db, stmt, sessionName);
+      if (synthetic) {
+        if (synthetic.kind === "message") {
+          messages.push(synthetic.message);
+        } else {
+          lastSelectOutput = formatTable(synthetic.columns, synthetic.rows);
+          lastRawResult = { columns: synthetic.columns, rows: synthetic.rows };
+          if (synthetic.message) {
+            messages.push(synthetic.message);
+          }
+        }
+        continue;
+      }
 
-      // ── Handle Oracle/MySQL commands not supported in SQLite ──
-      // These are commonly used by students but have no SQLite equivalent.
-      if (upperStmt.startsWith("CREATE DATABASE")) {
-        messages.push({ type: "success", text: "Database created. (Note: BitLab uses per-session databases automatically)" });
-        continue;
-      }
-      if (upperStmt.startsWith("USE ")) {
-        messages.push({ type: "success", text: "Database changed. (Note: BitLab uses per-session databases automatically)" });
-        continue;
-      }
-      if (upperStmt.startsWith("GRANT") || upperStmt.startsWith("REVOKE")) {
-        messages.push({ type: "success", text: "Statement executed successfully." });
-        continue;
-      }
       if (upperStmt === "COMMIT" || upperStmt === "ROLLBACK") {
         messages.push({ type: "success", text: `${upperStmt === "COMMIT" ? "Commit" : "Rollback"} complete.` });
         continue;
       }
-      if (upperStmt.startsWith("SET ") || upperStmt.startsWith("SHOW ")) {
+      if (upperStmt.startsWith("SET ")) {
         messages.push({ type: "info", text: "Statement acknowledged." });
         continue;
       }
@@ -160,7 +356,8 @@ export function executeSQL(db: Database, code: string): ExecutionResult {
 
       if (upperStmt.startsWith("SELECT") || upperStmt.startsWith("WITH") || upperStmt.startsWith("PRAGMA")) {
         // SELECT / WITH — returns rows
-        const results = db.exec(stmt);
+        const execStmt = translateOracleSql(stmt);
+        const results = db.exec(execStmt);
         if (results.length > 0 && results[0].columns.length > 0) {
           const columns = results[0].columns;
           const rows = results[0].values.map((row) =>
@@ -168,7 +365,6 @@ export function executeSQL(db: Database, code: string): ExecutionResult {
           );
           lastSelectOutput = formatTable(columns, rows);
           lastRawResult = { columns, rows };
-          totalRows += rows.length;
           messages.push({
             type: "success",
             text: `${rows.length} row${rows.length !== 1 ? "s" : ""} returned.`,
@@ -177,21 +373,21 @@ export function executeSQL(db: Database, code: string): ExecutionResult {
           messages.push({ type: "info", text: "Query returned no results." });
         }
       } else if (upperStmt.startsWith("INSERT")) {
-        db.run(stmt);
+        db.run(translateOracleSql(stmt));
         const changes = db.getRowsModified();
         messages.push({
           type: "success",
           text: `${changes} row${changes !== 1 ? "s" : ""} inserted.`,
         });
       } else if (upperStmt.startsWith("UPDATE")) {
-        db.run(stmt);
+        db.run(translateOracleSql(stmt));
         const changes = db.getRowsModified();
         messages.push({
           type: "success",
           text: `${changes} row${changes !== 1 ? "s" : ""} updated.`,
         });
       } else if (upperStmt.startsWith("DELETE")) {
-        db.run(stmt);
+        db.run(translateOracleSql(stmt));
         const changes = db.getRowsModified();
         messages.push({
           type: "success",
@@ -199,7 +395,7 @@ export function executeSQL(db: Database, code: string): ExecutionResult {
         });
       } else {
         // DDL or other
-        db.run(stmt);
+        db.run(translateOracleSql(stmt));
         const ddlMsg = classifyStatement(stmt);
         messages.push({
           type: "success",
@@ -208,10 +404,21 @@ export function executeSQL(db: Database, code: string): ExecutionResult {
       }
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      messages.push({
-        type: "error",
-        text: mapSqliteError(errMsg),
-      });
+      
+      if (
+        upperStmt.startsWith("CREATE TABLE") &&
+        /(foreign key|no such table|references)/i.test(errMsg)
+      ) {
+        messages.push({
+          type: "error",
+          text: `Line ${lineNo + lineOffset}: ORA-02270: no matching unique or primary key for this column-list (referenced table may not exist yet — create parent table first)`,
+        });
+      } else {
+        messages.push({
+          type: "error",
+          text: `Line ${lineNo + lineOffset}: ${mapSqliteError(errMsg)}`,
+        });
+      }
     }
   }
 

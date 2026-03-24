@@ -11,12 +11,15 @@
 
 import type { Database } from "sql.js";
 import { mapSqliteError } from "./oracleErrors";
+import { executeSQL, translateOracleSql } from "./sqlEngine";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
 export interface PLSQLResult {
   output: string[];        // DBMS_OUTPUT lines
   messages: Array<{ type: "success" | "error" | "info"; text: string }>;
+  sqlOutput?: string | null;
+  rawResult?: { columns: string[]; rows: string[][] } | null;
 }
 
 interface Variable {
@@ -40,6 +43,11 @@ interface StoredProgram {
   params: Array<{ name: string; mode: string; type: string }>;
   body: string;
   returnType?: string;
+}
+
+function toOracleErrorText(errMsg: string): string {
+  if (/^\s*(ORA-\d+|ERROR:|Line\s+\d+:)/i.test(errMsg)) return errMsg;
+  return mapSqliteError(errMsg);
 }
 
 // ── Execution Context ──────────────────────────────────────────────────
@@ -124,6 +132,11 @@ function evaluateExpression(expr: string, ctx: ExecutionContext): unknown {
   if (cursorAttrMatch) {
     const cursorName = cursorAttrMatch[1].toUpperCase();
     const attr = cursorAttrMatch[2].toUpperCase();
+    if (cursorName === "SQL") {
+      if (attr === "FOUND") return Boolean(ctx.getVar("SQL%FOUND"));
+      if (attr === "NOTFOUND") return Boolean(ctx.getVar("SQL%NOTFOUND"));
+      return Number(ctx.getVar("SQL%ROWCOUNT") ?? 0);
+    }
     const cursor = ctx.cursors.get(cursorName);
     if (!cursor) return null;
     switch (attr) {
@@ -132,6 +145,15 @@ function evaluateExpression(expr: string, ctx: ExecutionContext): unknown {
       case "ROWCOUNT": return cursor.position;
       case "ISOPEN": return cursor.isOpen;
     }
+  }
+
+  // Implicit SQL cursor attributes for last DML statement
+  const implicitSqlAttrMatch = e.match(/^SQL%(NOTFOUND|FOUND|ROWCOUNT)$/i);
+  if (implicitSqlAttrMatch) {
+    const attr = implicitSqlAttrMatch[1].toUpperCase();
+    if (attr === "FOUND") return Boolean(ctx.getVar("SQL%FOUND"));
+    if (attr === "NOTFOUND") return Boolean(ctx.getVar("SQL%NOTFOUND"));
+    return Number(ctx.getVar("SQL%ROWCOUNT") ?? 0);
   }
 
   // Function call: UPPER(), LOWER(), LENGTH(), TO_CHAR(), etc.
@@ -425,7 +447,7 @@ function parseDeclareSection(lines: string[], ctx: ExecutionContext) {
  * Executes a list of PL/SQL body lines within the given context.
  * Returns the index of the last processed line.
  */
-function executeBody(lines: string[], ctx: ExecutionContext): void {
+function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: number[]): void {
   let i = 0;
   const maxIterations = 100000; // safety limit
   let iterations = 0;
@@ -434,11 +456,12 @@ function executeBody(lines: string[], ctx: ExecutionContext): void {
     if (ctx.exitLoop || ctx.hasReturned) break;
     if (++iterations > maxIterations) throw new Error("Infinite loop detected");
 
+    const currentLineNo = lineNumbers?.[i] ?? (i + 1);
     const rawLine = lines[i].trim();
     const line = rawLine.replace(/;$/, "").trim();
     const upper = line.toUpperCase();
 
-    if (!line || upper === "BEGIN" || upper === "END" || upper === "NULL") {
+    if (!line || line === "/" || upper === "BEGIN" || upper === "END" || upper === "NULL") {
       i++;
       continue;
     }
@@ -529,7 +552,7 @@ function executeBody(lines: string[], ctx: ExecutionContext): void {
           }
         }
         try {
-          const result = ctx.db.exec(query);
+          const result = ctx.db.exec(translateOracleSql(query));
           if (result.length > 0) {
             cursor.columns = result[0].columns;
             cursor.rows = result[0].values;
@@ -540,7 +563,8 @@ function executeBody(lines: string[], ctx: ExecutionContext): void {
           cursor.position = 0;
           cursor.isOpen = true;
         } catch (err: unknown) {
-          throw new Error(mapSqliteError(err instanceof Error ? err.message : String(err)));
+          const msg = err instanceof Error ? err.message : String(err);
+          throw new Error(`Line ${currentLineNo}: ${toOracleErrorText(msg)}`);
         }
       }
       i++;
@@ -590,7 +614,7 @@ function executeBody(lines: string[], ctx: ExecutionContext): void {
       // Build a real SELECT query without INTO
       const query = `SELECT ${selectCols} FROM ${fromClause}`;
       try {
-        const result = ctx.db.exec(query);
+        const result = ctx.db.exec(translateOracleSql(query));
         if (result.length === 0 || result[0].values.length === 0) {
           throw new Error("NO_DATA_FOUND");
         }
@@ -604,7 +628,7 @@ function executeBody(lines: string[], ctx: ExecutionContext): void {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg === "NO_DATA_FOUND" || msg === "TOO_MANY_ROWS") throw err;
-        throw new Error(mapSqliteError(msg));
+        throw new Error(`Line ${currentLineNo}: ${toOracleErrorText(msg)}`);
       }
       i++;
       continue;
@@ -612,9 +636,10 @@ function executeBody(lines: string[], ctx: ExecutionContext): void {
 
     // ── DML: INSERT, UPDATE, DELETE ──
     if (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE")) {
+      const merged = collectStatement(lines, i);
       try {
         // Resolve variables in the DML statement
-        let query = line;
+        let query = merged.statement;
         for (const [varName, variable] of ctx.variables) {
           const re = new RegExp(`\\b${varName}\\b`, "g");
           if (typeof variable.value === "string") {
@@ -623,22 +648,29 @@ function executeBody(lines: string[], ctx: ExecutionContext): void {
             query = query.replace(re, String(variable.value));
           }
         }
-        ctx.db.run(query);
+        ctx.db.run(translateOracleSql(query));
+        const rows = ctx.db.getRowsModified();
+        ctx.setVar("SQL%ROWCOUNT", rows);
+        ctx.setVar("SQL%FOUND", rows > 0);
+        ctx.setVar("SQL%NOTFOUND", rows === 0);
       } catch (err: unknown) {
-        throw new Error(mapSqliteError(err instanceof Error ? err.message : String(err)));
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`Line ${currentLineNo}: ${toOracleErrorText(msg)}`);
       }
-      i++;
+      i = merged.nextIndex;
       continue;
     }
 
     // ── CREATE TABLE / DDL inside PL/SQL ──
     if (upper.startsWith("CREATE") || upper.startsWith("DROP") || upper.startsWith("ALTER")) {
+      const merged = collectStatement(lines, i);
       try {
-        ctx.db.run(line);
+        ctx.db.run(translateOracleSql(merged.statement));
       } catch (err: unknown) {
-        throw new Error(mapSqliteError(err instanceof Error ? err.message : String(err)));
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`Line ${currentLineNo}: ${toOracleErrorText(msg)}`);
       }
-      i++;
+      i = merged.nextIndex;
       continue;
     }
 
@@ -684,6 +716,28 @@ function executeBody(lines: string[], ctx: ExecutionContext): void {
 
     i++;
   }
+}
+
+function collectStatement(lines: string[], startIdx: number): { statement: string; nextIndex: number } {
+  const parts: string[] = [];
+  let i = startIdx;
+
+  while (i < lines.length) {
+    const fragment = lines[i].trim();
+    if (!fragment) {
+      i++;
+      continue;
+    }
+    parts.push(fragment);
+    if (fragment.endsWith(";")) {
+      i++;
+      break;
+    }
+    i++;
+  }
+
+  const statement = parts.join(" ").replace(/;+\s*$/, "").trim();
+  return { statement, nextIndex: i };
 }
 
 // ── IF Statement ───────────────────────────────────────────────────────
@@ -911,6 +965,8 @@ export function executePLSQL(
 ): PLSQLResult {
   const output: string[] = [];
   const messages: Array<{ type: "success" | "error" | "info"; text: string }> = [];
+  let sqlOutput: string | null = null;
+  let rawResult: { columns: string[]; rows: string[][] } | null = null;
   const startTime = performance.now();
 
   // Timestamp separator
@@ -918,6 +974,31 @@ export function executePLSQL(
   messages.push({ type: "info", text: `── Run at ${ts} ──` });
 
   try {
+    const normalizedCode = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const scriptLines = normalizedCode.split("\n");
+    const firstBlockStart = scriptLines.findIndex((l) => /^\s*(DECLARE|BEGIN)\b/i.test(l));
+    let lineOffset = 0;
+
+    if (firstBlockStart > 0) {
+      const prelude = scriptLines.slice(0, firstBlockStart).join("\n").trim();
+      if (prelude) {
+        const sqlResult = executeSQL(db, prelude, { lineOffset: 0 });
+        messages.push(...sqlResult.messages.filter((m) => !m.text.startsWith("── Run at")));
+        sqlOutput = sqlResult.output;
+        rawResult = sqlResult.rawResult;
+      }
+      code = scriptLines.slice(firstBlockStart).join("\n");
+      lineOffset = firstBlockStart;
+    } else {
+      code = normalizedCode;
+    }
+
+    // Oracle script terminator for PL/SQL blocks
+    code = code
+      .split("\n")
+      .filter((l) => l.trim() !== "/")
+      .join("\n");
+
     // Check for CREATE PROCEDURE / FUNCTION
     const createMatch = code.match(/^CREATE\s+(?:OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION)\b/i);
     if (createMatch) {
@@ -927,7 +1008,7 @@ export function executePLSQL(
         messages.push({ type: "success", text: `${prog.type === "PROCEDURE" ? "Procedure" : "Function"} ${prog.name} created.` });
         const elapsed = ((performance.now() - startTime) / 1000).toFixed(3);
         messages.push({ type: "info", text: `Executed in ${elapsed}s` });
-        return { output, messages };
+        return { output, messages, sqlOutput, rawResult };
       }
     }
 
@@ -938,7 +1019,7 @@ export function executePLSQL(
       const proc = storedPrograms.get(procName);
       if (!proc) {
         messages.push({ type: "error", text: `ORA-06550: procedure ${procName} not found` });
-        return { output, messages };
+        return { output, messages, sqlOutput, rawResult };
       }
       const ctx = new ExecutionContext(db, storedPrograms);
       const argStrs = splitFunctionArgs(execMatch[2]);
@@ -954,17 +1035,31 @@ export function executePLSQL(
     // Parse standard DECLARE...BEGIN...EXCEPTION...END block
     const lines = code.split("\n");
     const ctx = new ExecutionContext(db, storedPrograms);
+    ctx.setVar("SQL%ROWCOUNT", 0);
+    ctx.setVar("SQL%FOUND", false);
+    ctx.setVar("SQL%NOTFOUND", true);
 
     // Find DECLARE, BEGIN, EXCEPTION, END sections
     let declareLines: string[] = [];
     let bodyLines: string[] = [];
+    let bodyLineNumbers: number[] = [];
     let exceptionLines: string[] = [];
-    let section: "BEFORE" | "DECLARE" | "BEGIN" | "EXCEPTION" = "BEFORE";
+    let trailingLines: string[] = [];
+    let trailingStartLine = 0;
+    let section: "BEFORE" | "DECLARE" | "BEGIN" | "EXCEPTION" | "AFTER" = "BEFORE";
     let beginDepth = 0;
 
-    for (const rawLine of lines) {
+    for (let idx = 0; idx < lines.length; idx++) {
+      const rawLine = lines[idx];
+      const absoluteLineNo = idx + 1 + lineOffset;
       const trimmed = rawLine.trim();
       const upper = trimmed.toUpperCase().replace(/;$/, "").trim();
+
+      if (section === "AFTER") {
+        if (!trailingStartLine && trimmed) trailingStartLine = absoluteLineNo;
+        trailingLines.push(rawLine);
+        continue;
+      }
 
       if (upper === "DECLARE" && section === "BEFORE") {
         section = "DECLARE";
@@ -977,6 +1072,7 @@ export function executePLSQL(
       if (upper === "BEGIN" && section === "BEGIN") {
         beginDepth++;
         bodyLines.push(rawLine);
+        bodyLineNumbers.push(absoluteLineNo);
         continue;
       }
       if (upper === "EXCEPTION" && section === "BEGIN" && beginDepth === 0) {
@@ -986,6 +1082,11 @@ export function executePLSQL(
       if (/^END\s*;?\s*$/i.test(trimmed) && section === "BEGIN" && beginDepth > 0) {
         beginDepth--;
         bodyLines.push(rawLine);
+        bodyLineNumbers.push(absoluteLineNo);
+        continue;
+      }
+      if (/^END\s*;?\s*$/i.test(trimmed) && section === "BEGIN" && beginDepth === 0) {
+        section = "AFTER";
         continue;
       }
 
@@ -995,6 +1096,7 @@ export function executePLSQL(
           break;
         case "BEGIN":
           bodyLines.push(trimmed);
+          bodyLineNumbers.push(absoluteLineNo);
           break;
         case "EXCEPTION":
           exceptionLines.push(trimmed);
@@ -1007,7 +1109,7 @@ export function executePLSQL(
 
     // Execute BEGIN body
     try {
-      executeBody(bodyLines, ctx);
+      executeBody(bodyLines, ctx, bodyLineNumbers);
       output.push(...ctx.dbmsOutput);
       messages.push({ type: "success", text: "PL/SQL procedure successfully completed." });
     } catch (err: unknown) {
@@ -1020,22 +1122,35 @@ export function executePLSQL(
         if (handled) {
           messages.push({ type: "success", text: "PL/SQL procedure completed with handled exception." });
         } else {
-          messages.push({ type: "error", text: mapSqliteError(errMsg) });
+          messages.push({ type: "error", text: toOracleErrorText(errMsg) });
         }
       } else {
         output.push(...ctx.dbmsOutput);
-        messages.push({ type: "error", text: mapSqliteError(errMsg) });
+        messages.push({ type: "error", text: toOracleErrorText(errMsg) });
       }
+    }
+
+    const trailingSql = trailingLines
+      .filter((l) => l.trim() !== "/")
+      .join("\n")
+      .trim();
+    if (trailingSql) {
+      const sqlResult = executeSQL(db, trailingSql, {
+        lineOffset: trailingStartLine > 0 ? trailingStartLine - 1 : lineOffset,
+      });
+      messages.push(...sqlResult.messages.filter((m) => !m.text.startsWith("── Run at")));
+      sqlOutput = sqlResult.output;
+      rawResult = sqlResult.rawResult;
     }
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    messages.push({ type: "error", text: mapSqliteError(errMsg) });
+    messages.push({ type: "error", text: toOracleErrorText(errMsg) });
   }
 
   const elapsed = ((performance.now() - startTime) / 1000).toFixed(3);
   messages.push({ type: "info", text: `Executed in ${elapsed}s` });
 
-  return { output, messages };
+  return { output, messages, sqlOutput, rawResult };
 }
 
 // ── Exception Handler ──────────────────────────────────────────────────
