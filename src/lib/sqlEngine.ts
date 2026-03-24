@@ -38,6 +38,7 @@ type SyntheticStatementResult =
 
 interface ExecuteSQLOptions {
   sessionName?: string;
+  databaseName?: string;
   lineOffset?: number;
 }
 
@@ -197,7 +198,7 @@ function stripIdentifierQuotes(value: string): string {
   return value.replace(/^["'`]|["'`]$/g, "");
 }
 
-function preprocessStatement(db: Database, statement: string, sessionName: string): SyntheticStatementResult | null {
+function preprocessStatement(db: Database, statement: string, databaseName: string): SyntheticStatementResult | null {
   const trimmed = statement.trim().replace(/;+\s*$/, "");
 
   const createDbMatch = trimmed.match(/^CREATE\s+DATABASE\s+([`"']?[\w$]+[`"']?)$/i);
@@ -237,7 +238,7 @@ function preprocessStatement(db: Database, statement: string, sessionName: strin
     return {
       kind: "table",
       columns: ["Database"],
-      rows: [[sessionName]],
+      rows: [[databaseName]],
       message: { type: "success", text: "1 row returned." },
     };
   }
@@ -290,7 +291,7 @@ export function executeSQL(db: Database, code: string, options: ExecuteSQLOption
   const messages: OutputMessage[] = [];
   let output: string | null = null;
   let rawResult: { columns: string[]; rows: string[][] } | null = null;
-  const sessionName = options.sessionName || "session";
+  const databaseName = options.databaseName || options.sessionName || "session";
   const lineOffset = options.lineOffset || 0;
 
   // Run separator
@@ -314,7 +315,7 @@ export function executeSQL(db: Database, code: string, options: ExecuteSQLOption
     const lineNo = parsed.line;
     const upperStmt = stmt.trim().toUpperCase();
     try {
-      const synthetic = preprocessStatement(db, stmt, sessionName);
+      const synthetic = preprocessStatement(db, stmt, databaseName);
       if (synthetic) {
         if (synthetic.kind === "message") {
           messages.push(synthetic.message);

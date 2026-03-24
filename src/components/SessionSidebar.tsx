@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Pencil } from "lucide-react";
 import type { Session } from "@/pages/BitLab";
-import SchemaExplorer, { type SchemaTable } from "./SchemaExplorer";
+import SchemaExplorer, { type SchemaDatabase } from "./SchemaExplorer";
 
 interface SessionSidebarProps {
   sessions: Session[];
@@ -9,10 +9,21 @@ interface SessionSidebarProps {
   onSelect: (id: string) => void;
   onAdd: () => void;
   onRename: (id: string, name: string) => void;
-  schemaTables: SchemaTable[];
+  schemaDatabases: SchemaDatabase[];
+  selectedTableKey?: string | null;
+  onSelectTable?: (databaseName: string, tableName: string) => void;
 }
 
-const SessionSidebar = ({ sessions, activeId, onSelect, onAdd, onRename, schemaTables }: SessionSidebarProps) => {
+const SessionSidebar = ({
+  sessions,
+  activeId,
+  onSelect,
+  onAdd,
+  onRename,
+  schemaDatabases,
+  selectedTableKey,
+  onSelectTable,
+}: SessionSidebarProps) => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
 
@@ -92,7 +103,11 @@ const SessionSidebar = ({ sessions, activeId, onSelect, onAdd, onRename, schemaT
 
       {/* Schema Explorer - bottom half */}
       <div className="flex-1 flex flex-col min-h-0">
-        <SchemaExplorer tables={schemaTables} />
+        <SchemaExplorer
+          databases={schemaDatabases}
+          selectedTableKey={selectedTableKey}
+          onSelectTable={onSelectTable}
+        />
       </div>
     </div>
   );

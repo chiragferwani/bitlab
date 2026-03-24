@@ -4,12 +4,12 @@ import TopBar from "@/components/TopBar";
 import SessionSidebar from "@/components/SessionSidebar";
 import CodeEditorPanel from "@/components/CodeEditorPanel";
 import OutputConsole from "@/components/OutputConsole";
-import type { SchemaTable } from "@/components/SchemaExplorer";
+import type { SchemaDatabase } from "@/components/SchemaExplorer";
 import { initDatabase, createDatabase, introspectSchema } from "@/lib/database";
 import { executeSQL } from "@/lib/sqlEngine";
 import { executePLSQL } from "@/lib/plsqlInterpreter";
 import { detectMode } from "@/lib/keywords";
-import { formatCsv } from "@/lib/tableFormatter";
+import { formatCsv, formatTable } from "@/lib/tableFormatter";
 
 export interface Session {
   id: string;
@@ -25,6 +25,25 @@ const defaultSession: Session = {
   mode: "SQL",
 };
 
+function inferActiveDatabaseNameFromMessages(
+  currentName: string,
+  messages: Array<{ type: "success" | "error" | "info"; text: string }>
+): string {
+  let nextName = currentName;
+  for (const message of messages) {
+    const useMatch = message.text.match(/^Database context switched to "([^"]+)"/i);
+    if (useMatch) {
+      nextName = useMatch[1];
+      continue;
+    }
+    const dropMatch = message.text.match(/^Database "([^"]+)" dropped\./i);
+    if (dropMatch && dropMatch[1] === nextName) {
+      nextName = "session";
+    }
+  }
+  return nextName;
+}
+
 const BitLab = () => {
   const [sessions, setSessions] = useState<Session[]>([defaultSession]);
   const [activeId, setActiveId] = useState("1");
@@ -33,13 +52,16 @@ const BitLab = () => {
   const [bootVisible, setBootVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(200);
   const [outputWidth, setOutputWidth] = useState(340);
-  const [schemaTables, setSchemaTables] = useState<SchemaTable[]>([]);
+  const [schemaDatabases, setSchemaDatabases] = useState<SchemaDatabase[]>([]);
+  const [selectedTableKey, setSelectedTableKey] = useState<string | null>(null);
   const [dbReady, setDbReady] = useState(false);
 
   // Per-session database instances
   const dbMapRef = useRef<Map<string, Database>>(new Map());
   // Per-session stored procedures/functions
   const procsMapRef = useRef<Map<string, Map<string, any>>>(new Map());
+  // Per-session active logical database name for schema tree and SHOW DATABASES
+  const databaseNameMapRef = useRef<Map<string, string>>(new Map([["1", "session"]]));
   // Raw result for CSV export
   const [rawResult, setRawResult] = useState<{ columns: string[]; rows: string[][] } | null>(null);
 
@@ -53,6 +75,7 @@ const BitLab = () => {
         const db = createDatabase();
         dbMapRef.current.set("1", db);
         procsMapRef.current.set("1", new Map());
+        refreshSchema("1");
         setDbReady(true);
         console.log("[BitLab] sql.js initialized, database ready.");
       })
@@ -71,6 +94,17 @@ const BitLab = () => {
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, ...updates } : s)));
   };
 
+  const refreshSchema = (sessionId: string) => {
+    const db = dbMapRef.current.get(sessionId);
+    if (!db) {
+      setSchemaDatabases([]);
+      return;
+    }
+    const schema = introspectSchema(db);
+    const databaseName = databaseNameMapRef.current.get(sessionId) || "session";
+    setSchemaDatabases([{ name: databaseName, tables: schema }]);
+  };
+
   const addSession = () => {
     if (!dbReady) return;
     const newId = String(Date.now());
@@ -85,8 +119,11 @@ const BitLab = () => {
     const db = createDatabase();
     dbMapRef.current.set(newId, db);
     procsMapRef.current.set(newId, new Map());
+    databaseNameMapRef.current.set(newId, "session");
     setSessions((prev) => [...prev, newSession]);
     setActiveId(newId);
+    setSelectedTableKey(null);
+    refreshSchema(newId);
   };
 
   const deleteSession = () => {
@@ -94,13 +131,19 @@ const BitLab = () => {
     // Close the DB for the deleted session
     const db = dbMapRef.current.get(activeId);
     if (db) {
-      try { db.close(); } catch { /* ignore */ }
+      try {
+        db.close();
+      } catch {
+        // ignore close failures
+      }
       dbMapRef.current.delete(activeId);
     }
     procsMapRef.current.delete(activeId);
+    databaseNameMapRef.current.delete(activeId);
     const remaining = sessions.filter((s) => s.id !== activeId);
     setSessions(remaining);
     setActiveId(remaining[0].id);
+    setSelectedTableKey(null);
     setOutput(null);
     setMessages([]);
     setRawResult(null);
@@ -108,18 +151,9 @@ const BitLab = () => {
     refreshSchema(remaining[0].id);
   };
 
-  const refreshSchema = (sessionId: string) => {
-    const db = dbMapRef.current.get(sessionId);
-    if (db) {
-      const schema = introspectSchema(db);
-      setSchemaTables(schema);
-    } else {
-      setSchemaTables([]);
-    }
-  };
-
   const handleSelectSession = useCallback((id: string) => {
     setActiveId(id);
+    setSelectedTableKey(null);
     setOutput(null);
     setMessages([]);
     setRawResult(null);
@@ -132,6 +166,37 @@ const BitLab = () => {
     // Auto-detect mode
     const mode = detectMode(code);
     updateSession(activeId, { code, mode });
+  }, [activeId]);
+
+  const handleSelectSchemaTable = useCallback((databaseName: string, tableName: string) => {
+    const db = dbMapRef.current.get(activeId);
+    if (!db) return;
+
+    const safeTableName = tableName.replace(/"/g, "\"\"");
+    const sql = `SELECT * FROM "${safeTableName}" LIMIT 200`;
+
+    try {
+      const results = db.exec(sql);
+      if (results.length === 0 || results[0].columns.length === 0) {
+        setOutput(null);
+        setRawResult(null);
+        setMessages((prev) => [...prev, { type: "info", text: `No rows in ${databaseName}.${tableName}.` }]);
+      } else {
+        const columns = results[0].columns;
+        const rows = results[0].values.map((row) => row.map((v) => (v === null ? "NULL" : String(v))));
+        setOutput(formatTable(columns, rows));
+        setRawResult({ columns, rows });
+        setMessages((prev) => [
+          ...prev,
+          { type: "info", text: `Previewing ${databaseName}.${tableName} (up to 200 rows).` },
+          { type: "success", text: `${rows.length} row${rows.length !== 1 ? "s" : ""} returned.` },
+        ]);
+      }
+      setSelectedTableKey(`${databaseName}.${tableName}`);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      setMessages((prev) => [...prev, { type: "error", text: `Failed to preview ${tableName}: ${errMsg}` }]);
+    }
   }, [activeId]);
 
   const runQuery = useCallback((codeOverride?: string) => {
@@ -169,12 +234,20 @@ const BitLab = () => {
         setMessages((prev) => [...prev, ...result.messages]);
       } else {
         // SQL execution
-        const result = executeSQL(db, code, { sessionName: session.name });
+        const currentDatabaseName = databaseNameMapRef.current.get(activeId) || "session";
+        const result = executeSQL(db, code, {
+          sessionName: session.name,
+          databaseName: currentDatabaseName,
+        });
         setOutput(result.output);
         setRawResult(result.rawResult);
         setMessages((prev) => [...prev, ...result.messages]);
+
+        const inferredDatabaseName = inferActiveDatabaseNameFromMessages(currentDatabaseName, result.messages);
+        databaseNameMapRef.current.set(activeId, inferredDatabaseName);
       }
     } finally {
+      setSelectedTableKey(null);
       // Refresh schema after every execution batch, even when statements error
       refreshSchema(activeId);
     }
@@ -230,7 +303,9 @@ const BitLab = () => {
             onSelect={handleSelectSession}
             onAdd={addSession}
             onRename={(id, name) => updateSession(id, { name })}
-            schemaTables={schemaTables}
+            schemaDatabases={schemaDatabases}
+            selectedTableKey={selectedTableKey}
+            onSelectTable={handleSelectSchemaTable}
           />
         </div>
         <div
