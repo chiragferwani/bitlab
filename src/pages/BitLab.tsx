@@ -18,12 +18,7 @@ export interface Session {
   mode: "SQL" | "PL/SQL";
 }
 
-const defaultSession: Session = {
-  id: "1",
-  name: "query_01.sql",
-  code: "",
-  mode: "SQL",
-};
+
 
 function inferActiveDatabaseNameFromMessages(
   currentName: string,
@@ -45,8 +40,8 @@ function inferActiveDatabaseNameFromMessages(
 }
 
 const BitLab = () => {
-  const [sessions, setSessions] = useState<Session[]>([defaultSession]);
-  const [activeId, setActiveId] = useState("1");
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [activeId, setActiveId] = useState("");
   const [output, setOutput] = useState<string | null>(null);
   const [messages, setMessages] = useState<Array<{ type: "success" | "error" | "info"; text: string }>>([]);
   const [bootVisible, setBootVisible] = useState(true);
@@ -61,21 +56,25 @@ const BitLab = () => {
   // Per-session stored procedures/functions
   const procsMapRef = useRef<Map<string, Map<string, any>>>(new Map());
   // Per-session active logical database name for schema tree and SHOW DATABASES
-  const databaseNameMapRef = useRef<Map<string, string>>(new Map([["1", "session"]]));
+  const databaseNameMapRef = useRef<Map<string, string>>(new Map());
   // Raw result for CSV export
   const [rawResult, setRawResult] = useState<{ columns: string[]; rows: string[][] } | null>(null);
 
   const activeSession = sessions.find((s) => s.id === activeId) || sessions[0];
 
-  // Initialize sql.js on mount
+  // Initialize sql.js on mount — session and DB are created together
+  // to guarantee the DB instance exists before the session is visible in state.
   useEffect(() => {
     initDatabase()
       .then(() => {
-        // Create DB for default session
+        const defaultId = crypto.randomUUID();
         const db = createDatabase();
-        dbMapRef.current.set("1", db);
-        procsMapRef.current.set("1", new Map());
-        refreshSchema("1");
+        dbMapRef.current.set(defaultId, db);
+        procsMapRef.current.set(defaultId, new Map());
+        databaseNameMapRef.current.set(defaultId, "session");
+        setSessions([{ id: defaultId, name: "query_01.sql", code: "", mode: "SQL" }]);
+        setActiveId(defaultId);
+        refreshSchema(defaultId);
         setDbReady(true);
         console.log("[BitLab] sql.js initialized, database ready.");
       })
