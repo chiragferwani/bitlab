@@ -1,5 +1,6 @@
 import { useState } from "react";
 import Grainient from "@/components/Grainient";
+import bitlabLogo from "@/assets/logo.png";
 
 interface LandingPageProps {
   onEnter: () => void;
@@ -51,7 +52,7 @@ const LandingPage = ({ onEnter }: LandingPageProps) => {
       <div className="relative z-10 flex flex-col items-center text-center px-6 w-full max-w-[1200px]">
         {/* Logo + Wordmark */}
         <div className="flex items-center gap-0 mb-14">
-          <img src="/logo.png" alt="BitLab logo" className="w-32 h-32" />
+          <img src={bitlabLogo} alt="BitLab logo" className="w-32 h-32" />
           <span className="font-bold text-3xl tracking-[0.2em] text-white uppercase">
             BitLab
           </span>

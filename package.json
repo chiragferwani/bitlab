@@ -1,7 +1,7 @@
 {
-  "name": "vite_react_shadcn_ts",
+  "name": "bitlab",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "BitLab offline SQL and PL/SQL desktop app",
   "author": {
     "name": "BitLab Team",
@@ -98,7 +98,9 @@
     "eslint-plugin-react-refresh": "^0.4.20",
     "globals": "^15.15.0",
     "jsdom": "^20.0.3",
+    "png-to-ico": "^3.0.1",
     "postcss": "^8.5.6",
+    "sharp": "^0.34.5",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.38.0",
@@ -109,7 +111,7 @@
   "build": {
     "appId": "com.bitlab.app",
     "productName": "BitLab",
-    "copyright": "Copyright \u00a9 2026",
+    "copyright": "Copyright © 2026",
     "directories": {
       "output": "release"
     },
@@ -146,6 +148,7 @@
         "deb"
       ],
       "icon": "assets/icons/icon.png",
+      "executableName": "bitlab",
       "category": "Development",
       "artifactName": "BitLab-${version}.${ext}"
     },
