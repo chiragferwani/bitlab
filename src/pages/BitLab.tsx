@@ -1,11 +1,12 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import type { Database } from "sql.js";
+import type { MutableRefObject } from "react";
 import TopBar from "@/components/TopBar";
 import SessionSidebar from "@/components/SessionSidebar";
 import CodeEditorPanel from "@/components/CodeEditorPanel";
 import OutputConsole from "@/components/OutputConsole";
 import type { SchemaDatabase } from "@/components/SchemaExplorer";
-import { initDatabase, createDatabase, introspectSchema } from "@/lib/database";
+import type { SchemaTableInfo } from "@/lib/database";
 import { executeSQL } from "@/lib/sqlEngine";
 import { executePLSQL } from "@/lib/plsqlInterpreter";
 import { detectMode } from "@/lib/keywords";
@@ -18,7 +19,16 @@ export interface Session {
   mode: "SQL" | "PL/SQL";
 }
 
-
+interface BitLabProps {
+  sessions: Session[];
+  setSessions: React.Dispatch<React.SetStateAction<Session[]>>;
+  activeId: string;
+  setActiveId: React.Dispatch<React.SetStateAction<string>>;
+  dbMapRef: MutableRefObject<Map<string, Database>>;
+  procsMapRef: MutableRefObject<Map<string, Map<string, any>>>;
+  databaseNameMapRef: MutableRefObject<Map<string, string>>;
+  introspectSchema: (db: Database) => SchemaTableInfo[];
+}
 
 function inferActiveDatabaseNameFromMessages(
   currentName: string,
@@ -39,9 +49,18 @@ function inferActiveDatabaseNameFromMessages(
   return nextName;
 }
 
-const BitLab = () => {
-  const [sessions, setSessions] = useState<Session[]>([]);
-  const [activeId, setActiveId] = useState("");
+import { createDatabase } from "@/lib/database";
+
+const BitLab = ({
+  sessions,
+  setSessions,
+  activeId,
+  setActiveId,
+  dbMapRef,
+  procsMapRef,
+  databaseNameMapRef,
+  introspectSchema,
+}: BitLabProps) => {
   const [output, setOutput] = useState<string | null>(null);
   const [messages, setMessages] = useState<Array<{ type: "success" | "error" | "info"; text: string }>>([]);
   const [bootVisible, setBootVisible] = useState(true);
@@ -49,45 +68,23 @@ const BitLab = () => {
   const [outputWidth, setOutputWidth] = useState(340);
   const [schemaDatabases, setSchemaDatabases] = useState<SchemaDatabase[]>([]);
   const [selectedTableKey, setSelectedTableKey] = useState<string | null>(null);
-  const [dbReady, setDbReady] = useState(false);
 
-  // Per-session database instances
-  const dbMapRef = useRef<Map<string, Database>>(new Map());
-  // Per-session stored procedures/functions
-  const procsMapRef = useRef<Map<string, Map<string, any>>>(new Map());
-  // Per-session active logical database name for schema tree and SHOW DATABASES
-  const databaseNameMapRef = useRef<Map<string, string>>(new Map());
   // Raw result for CSV export
   const [rawResult, setRawResult] = useState<{ columns: string[]; rows: string[][] } | null>(null);
 
   const activeSession = sessions.find((s) => s.id === activeId) || sessions[0];
 
-  // Initialize sql.js on mount — session and DB are created together
-  // to guarantee the DB instance exists before the session is visible in state.
-  useEffect(() => {
-    initDatabase()
-      .then(() => {
-        const defaultId = crypto.randomUUID();
-        const db = createDatabase();
-        dbMapRef.current.set(defaultId, db);
-        procsMapRef.current.set(defaultId, new Map());
-        databaseNameMapRef.current.set(defaultId, "session");
-        setSessions([{ id: defaultId, name: "query_01.sql", code: "", mode: "SQL" }]);
-        setActiveId(defaultId);
-        refreshSchema(defaultId);
-        setDbReady(true);
-        console.log("[BitLab] sql.js initialized, database ready.");
-      })
-      .catch((err) => {
-        console.error("[BitLab] Failed to initialize sql.js:", err);
-        setMessages([{ type: "error", text: `Failed to load SQL engine: ${err.message}` }]);
-      });
-  }, []);
-
   useEffect(() => {
     const timer = setTimeout(() => setBootVisible(false), 4000);
     return () => clearTimeout(timer);
   }, []);
+
+  // Refresh schema for the initial session on first mount
+  useEffect(() => {
+    if (sessions.length > 0 && activeId) {
+      refreshSchema(activeId);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateSession = (id: string, updates: Partial<Session>) => {
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, ...updates } : s)));
@@ -105,7 +102,6 @@ const BitLab = () => {
   };
 
   const addSession = () => {
-    if (!dbReady) return;
     const newId = String(Date.now());
     const num = sessions.length + 1;
     const newSession: Session = {
@@ -158,14 +154,14 @@ const BitLab = () => {
     setRawResult(null);
     // Refresh schema for the selected session
     refreshSchema(id);
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleCodeChange = useCallback((code: string) => {
     updateSession(activeId, { code });
     // Auto-detect mode
     const mode = detectMode(code);
     updateSession(activeId, { code, mode });
-  }, [activeId]);
+  }, [activeId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleSelectSchemaTable = useCallback((databaseName: string, tableName: string) => {
     const db = dbMapRef.current.get(activeId);
@@ -196,7 +192,7 @@ const BitLab = () => {
       const errMsg = err instanceof Error ? err.message : String(err);
       setMessages((prev) => [...prev, { type: "error", text: `Failed to preview ${tableName}: ${errMsg}` }]);
     }
-  }, [activeId]);
+  }, [activeId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const runQuery = useCallback((codeOverride?: string) => {
     const session = sessions.find((s) => s.id === activeId);
@@ -250,7 +246,7 @@ const BitLab = () => {
       // Refresh schema after every execution batch, even when statements error
       refreshSchema(activeId);
     }
-  }, [sessions, activeId]);
+  }, [sessions, activeId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleClear = useCallback(() => {
     setOutput(null);
