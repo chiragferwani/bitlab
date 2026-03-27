@@ -5,6 +5,7 @@
  */
 
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js";
+import wasmUrl from "sql.js/dist/sql-wasm.wasm?url";
 
 // Singleton reference to the sql.js library once initialized
 let SQL: SqlJsStatic | null = null;
@@ -16,10 +17,7 @@ let SQL: SqlJsStatic | null = null;
 export async function initDatabase(): Promise<void> {
   if (SQL) return;
   SQL = await initSqlJs({
-    locateFile: (file: string) => {
-      const isElectron = typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("electron");
-      return isElectron ? `./assets/${file}` : `/${file}`;
-    },
+    locateFile: () => wasmUrl,
   });
 }
 
