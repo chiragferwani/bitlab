@@ -13,14 +13,20 @@ const App = () => {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeId, setActiveId] = useState("");
   const [dbReady, setDbReady] = useState(false);
+  const [initError, setInitError] = useState<string | null>(null);
   const dbMapRef = useRef<Map<string, Database>>(new Map());
   const procsMapRef = useRef<Map<string, Map<string, any>>>(new Map());
   const databaseNameMapRef = useRef<Map<string, string>>(new Map());
 
   // Start sql.js initialization immediately — before user even clicks Get Started
   useEffect(() => {
+    const initTimeout = setTimeout(() => {
+      setInitError("Initialization timed out. The WASM engine could not be loaded.");
+    }, 10000); // 10 second timeout
+
     initDatabase()
       .then(() => {
+        clearTimeout(initTimeout);
         const defaultId = crypto.randomUUID();
         const db = createDatabase();
         dbMapRef.current.set(defaultId, db);
@@ -32,8 +38,12 @@ const App = () => {
         console.log("[App] sql.js initialized, database ready.");
       })
       .catch((err) => {
+        clearTimeout(initTimeout);
         console.error("[App] Failed to initialize sql.js:", err);
+        setInitError(`Failed to initialize database engine: ${err.message}`);
       });
+
+    return () => clearTimeout(initTimeout);
   }, []);
 
   if (loading) {
@@ -56,6 +66,37 @@ const App = () => {
               databaseNameMapRef={databaseNameMapRef}
               introspectSchema={introspectSchema}
             />
+          </div>
+        ) : initError ? (
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            height: '100vh',
+            background: '#0d1117',
+            color: '#f85149',
+            fontFamily: 'monospace',
+            fontSize: '13px',
+            gap: '12px'
+          }}>
+            <span>⚠ BitLab failed to initialize</span>
+            <span style={{ color: '#8b949e', fontSize: '11px' }}>{initError}</span>
+            <button
+              onClick={() => window.location.reload()}
+              style={{
+                marginTop: '8px',
+                padding: '6px 16px',
+                background: 'transparent',
+                border: '1px solid #30363d',
+                color: '#e6edf3',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontFamily: 'monospace'
+              }}
+            >
+              Retry
+            </button>
           </div>
         ) : (
           <div style={{

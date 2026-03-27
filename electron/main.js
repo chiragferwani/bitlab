@@ -1,5 +1,6 @@
-import { app, BrowserWindow, Menu } from "electron";
+import { app, BrowserWindow, Menu, protocol } from "electron";
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -42,7 +43,25 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  protocol.interceptFileProtocol("file", (request, callback) => {
+    let url = request.url.replace("file://", "");
+    if (url.endsWith("sql-wasm.wasm")) {
+      const wasmPath = path.join(__dirname, "..", "dist", "assets", "sql-wasm.wasm");
+      if (fs.existsSync(wasmPath)) {
+        callback({ path: wasmPath });
+        return;
+      }
+      // fallback
+      const fallback = path.join(__dirname, "..", "public", "sql-wasm.wasm");
+      callback({ path: fallback });
+      return;
+    }
+    callback({ path: decodeURIComponent(url) });
+  });
+
+  createWindow();
+});
 
 app.on("window-all-closed", () => {
   app.quit();
