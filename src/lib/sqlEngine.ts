@@ -50,11 +50,44 @@ interface ParsedStatement {
 /**
  * Translates common Oracle SQL expressions to SQLite-compatible SQL.
  */
+export function substituteSysdate(sql: string): string {
+  const now = new Date()
+  const dateStr = now.toISOString().split('T')[0] // 'YYYY-MM-DD'
+  // Replace SYSDATE-N with date arithmetic
+  let result = sql.replace(/SYSDATE\s*-\s*(\d+)/gi, (_, n) => {
+    const d = new Date(now)
+    d.setDate(d.getDate() - parseInt(n))
+    return `'${d.toISOString().split('T')[0]}'`
+  })
+  // Replace SYSDATE+N
+  result = result.replace(/SYSDATE\s*\+\s*(\d+)/gi, (_, n) => {
+    const d = new Date(now)
+    d.setDate(d.getDate() + parseInt(n))
+    return `'${d.toISOString().split('T')[0]}'`
+  })
+  // Replace bare SYSDATE
+  result = result.replace(/\bSYSDATE\b/gi, `'${dateStr}'`)
+  return result
+}
+
+export function transformDateArithmetic(sql: string): string {
+  // Transform: SYSDATE - ColumnName → CAST(julianday('now') - julianday(ColumnName) AS INTEGER)
+  let result = sql.replace(
+    /SYSDATE\s*-\s*([A-Za-z_][A-Za-z0-9_]*)/gi,
+    (_, col) => `CAST(julianday('now') - julianday(${col}) AS INTEGER)`
+  )
+  // Transform: ColumnName - SYSDATE → CAST(julianday(ColumnName) - julianday('now') AS INTEGER)
+  result = result.replace(
+    /([A-Za-z_][A-Za-z0-9_]*)\s*-\s*SYSDATE/gi,
+    (_, col) => `CAST(julianday(${col}) - julianday('now') AS INTEGER)`
+  )
+  return result
+}
+
 export function translateOracleSql(sql: string): string {
-  return sql
-    .replace(/\bSYSDATE\s*-\s*(\d+)\b/gi, "DATE('now', '-$1 day')")
-    .replace(/\bSYSDATE\s*\+\s*(\d+)\b/gi, "DATE('now', '+$1 day')")
-    .replace(/\bSYSDATE\b/gi, "DATE('now')");
+  let result = substituteSysdate(sql);
+  result = transformDateArithmetic(result);
+  return result;
 }
 
 /**
@@ -270,6 +303,31 @@ function preprocessStatement(db: Database, statement: string, databaseName: stri
 
   if (/^CONNECT\b/i.test(trimmed)) {
     return { kind: "message", message: { type: "success", text: "Connected." } };
+  }
+
+  // SET SERVEROUTPUT ON/OFF
+  if (/^SET\s+SERVEROUTPUT\s+(ON|OFF)/i.test(trimmed)) {
+    return {
+      kind: "message",
+      message: { type: "info", text: "Server output enabled." }
+    };
+  }
+
+  // Standalone / delimiter (Oracle script terminator)
+  if (/^\s*\/\s*$/.test(trimmed)) {
+    return {
+      kind: "message",
+      message: { type: "info", text: "" } // silently skip, handled as empty message
+    };
+  }
+
+  // COMMIT inside PL/SQL already handled but also intercept standalone
+  if (/^COMMIT\s*$/i.test(trimmed)) {
+    db.run('COMMIT');
+    return {
+      kind: "message",
+      message: { type: "success", text: "Commit complete." }
+    };
   }
 
   return null;

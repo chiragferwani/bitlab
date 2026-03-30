@@ -72,9 +72,9 @@ class ExecutionContext {
     const upper = name.toUpperCase();
     const existing = this.variables.get(upper);
     if (existing) {
-      existing.value = value;
+      assignVariable(this.variables, upper, value, existing.type);
     } else {
-      this.variables.set(upper, { name: upper, type: "VARCHAR2", value });
+      assignVariable(this.variables, upper, value, "VARCHAR2");
     }
   }
 
@@ -87,6 +87,36 @@ class ExecutionContext {
   hasVar(name: string): boolean {
     return this.variables.has(name.toUpperCase());
   }
+}
+
+/**
+ * Coerces variable values based on declared PL/SQL types.
+ */
+function assignVariable(
+  variables: Map<string, Variable>,
+  name: string,
+  value: any,
+  declaredType: string
+) {
+  const upper = name.toUpperCase();
+  const numericTypes = ['NUMBER', 'INTEGER', 'INT', 'FLOAT', 'DECIMAL', 'NUMERIC']
+  let finalValue = value;
+
+  if (numericTypes.some(t => declaredType.toUpperCase().startsWith(t))) {
+    finalValue = value === null || value === undefined || value === '' ? 0 : Number(value);
+    if (isNaN(finalValue)) finalValue = 0;
+  }
+
+  const existing = variables.get(upper);
+  if (existing) {
+    existing.value = finalValue;
+  } else {
+    variables.set(upper, { name: upper, type: declaredType.toUpperCase(), value: finalValue });
+  }
+}
+
+function evaluateBetween(value: any, low: any, high: any): boolean {
+  return Number(value) >= Number(low) && Number(value) <= Number(high);
 }
 
 // ── Expression Evaluator ───────────────────────────────────────────────
@@ -167,10 +197,23 @@ function evaluateExpression(expr: string, ctx: ExecutionContext): unknown {
 
   // Comparison expressions
   const compOps = [" >= ", " <= ", " != ", " <> ", " = ", " > ", " < ",
-                   " AND ", " OR "];
+                   " AND ", " OR ", " BETWEEN "];
   for (const op of compOps) {
     const idx = e.toUpperCase().indexOf(op);
     if (idx !== -1) {
+      if (op.trim().toUpperCase() === "BETWEEN") {
+        const valExpr = e.substring(0, idx).trim();
+        const rangeExpr = e.substring(idx + op.length).trim();
+        const andIdx = rangeExpr.toUpperCase().indexOf(" AND ");
+        if (andIdx !== -1) {
+          const lowExpr = rangeExpr.substring(0, andIdx).trim();
+          const highExpr = rangeExpr.substring(andIdx + 5).trim();
+          const val = evaluateExpression(valExpr, ctx);
+          const low = evaluateExpression(lowExpr, ctx);
+          const high = evaluateExpression(highExpr, ctx);
+          return evaluateBetween(val, low, high);
+        }
+      }
       const left = evaluateExpression(e.substring(0, idx), ctx);
       const right = evaluateExpression(e.substring(idx + op.length), ctx);
       return evaluateComparison(left, right, op.trim().toUpperCase());
@@ -268,7 +311,7 @@ function evaluateFunction(name: string, argsStr: string, ctx: ExecutionContext):
     case "TRIM": return String(args[0] ?? "").trim();
     case "LTRIM": return String(args[0] ?? "").replace(/^\s+/, "");
     case "RTRIM": return String(args[0] ?? "").replace(/\s+$/, "");
-    case "REPLACE": return String(args[0] ?? "").replaceAll(String(args[1] ?? ""), String(args[2] ?? ""));
+    case "REPLACE": return String(args[0] ?? "").replace(new RegExp(String(args[1] ?? "").replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), String(args[2] ?? ""));
     case "INSTR": return String(args[0] ?? "").indexOf(String(args[1] ?? "")) + 1;
     case "LPAD": {
       const s = String(args[0] ?? ""); const len = Number(args[1] ?? 0); const pad = String(args[2] ?? " ");
@@ -462,7 +505,7 @@ function parseDeclareSection(lines: string[], ctx: ExecutionContext) {
       const varType = varMatch[2].toUpperCase();
       const defaultExpr = varMatch[4];
       const defaultVal = defaultExpr ? evaluateExpression(defaultExpr.trim(), ctx) : null;
-      ctx.variables.set(varName, { name: varName, type: varType, value: defaultVal });
+      assignVariable(ctx.variables, varName, defaultVal, varType);
       continue;
     }
   }
@@ -489,6 +532,45 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
     const upper = line.toUpperCase();
 
     if (!line || line === "/" || upper === "BEGIN" || upper === "END" || upper === "NULL") {
+      i++;
+      continue;
+    }
+
+    // ── BEGIN EXECUTE IMMEDIATE ... EXCEPTION WHEN OTHERS THEN NULL; END ──
+    // Common Oracle pattern used for conditional DROP statements.
+    const guardedImmediateMatch = line.match(
+      /^BEGIN\s+EXECUTE\s+IMMEDIATE\s+([\s\S]+?)\s*;\s*EXCEPTION\s+WHEN\s+OTHERS\s+THEN\s+NULL\s*;\s*END$/i
+    );
+    if (guardedImmediateMatch) {
+      try {
+        const dynamicSql = evaluateExpression(guardedImmediateMatch[1], ctx);
+        if (typeof dynamicSql === "string" && dynamicSql.trim()) {
+          ctx.db.run(translateOracleSql(dynamicSql.trim()));
+        }
+      } catch {
+        // Intentionally swallow errors to mimic WHEN OTHERS THEN NULL
+      }
+      i++;
+      continue;
+    }
+
+    // ── EXECUTE IMMEDIATE ──
+    const executeImmediateMatch = line.match(/^EXECUTE\s+IMMEDIATE\s+([\s\S]+)$/i);
+    if (executeImmediateMatch) {
+      const dynamicSql = evaluateExpression(executeImmediateMatch[1], ctx);
+      const sqlText = String(dynamicSql ?? "").trim();
+      if (sqlText) {
+        try {
+          ctx.db.run(translateOracleSql(sqlText));
+          const rows = ctx.db.getRowsModified();
+          ctx.setVar("SQL%ROWCOUNT", rows);
+          ctx.setVar("SQL%FOUND", rows > 0);
+          ctx.setVar("SQL%NOTFOUND", rows === 0);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          throw new Error(`Line ${currentLineNo}: ${toOracleErrorText(msg)}`);
+        }
+      }
       i++;
       continue;
     }
@@ -845,7 +927,7 @@ function executeForLoop(
   }
 
   // Execute
-  ctx.variables.set(varName, { name: varName, type: "NUMBER", value: low });
+  assignVariable(ctx.variables, varName, low, "NUMBER");
   if (isReverse) {
     for (let j = high; j >= low; j--) {
       ctx.setVar(varName, j);
@@ -1166,12 +1248,28 @@ export function executePLSQL(
       .join("\n")
       .trim();
     if (trailingSql) {
-      const sqlResult = executeSQL(db, trailingSql, {
-        lineOffset: trailingStartLine > 0 ? trailingStartLine - 1 : lineOffset,
-      });
-      messages.push(...sqlResult.messages.filter((m) => !m.text.startsWith("── Run at")));
-      sqlOutput = sqlResult.output;
-      rawResult = sqlResult.rawResult;
+      if (shouldRunAsPLSQL(trailingSql)) {
+        const nested = executePLSQL(db, trailingSql, storedPrograms);
+        messages.push(
+          ...nested.messages.filter(
+            (m) => !m.text.startsWith("── Run at") && !m.text.startsWith("Executed in ")
+          )
+        );
+        if (nested.output.length > 0) {
+          output.push(...nested.output);
+        }
+        if (nested.sqlOutput) {
+          sqlOutput = nested.sqlOutput;
+          rawResult = nested.rawResult ?? null;
+        }
+      } else {
+        const sqlResult = executeSQL(db, trailingSql, {
+          lineOffset: trailingStartLine > 0 ? trailingStartLine - 1 : lineOffset,
+        });
+        messages.push(...sqlResult.messages.filter((m) => !m.text.startsWith("── Run at")));
+        sqlOutput = sqlResult.output;
+        rawResult = sqlResult.rawResult;
+      }
     }
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -1229,4 +1327,13 @@ function handleException(errMsg: string, exceptionLines: string[], ctx: Executio
   }
 
   return matched;
+}
+
+function shouldRunAsPLSQL(code: string): boolean {
+  return (
+    /\bDECLARE\b/i.test(code) ||
+    /\bBEGIN\b/i.test(code) ||
+    /\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:PROCEDURE|FUNCTION)\b/i.test(code) ||
+    /^\s*EXEC\s+\w+\s*\(/im.test(code)
+  );
 }

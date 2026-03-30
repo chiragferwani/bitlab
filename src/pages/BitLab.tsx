@@ -51,6 +51,14 @@ function inferActiveDatabaseNameFromMessages(
 
 import { createDatabase } from "@/lib/database";
 
+function normalizeQuotes(sql: string): string {
+  return sql
+    .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'") // single smart quotes → '
+    .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"') // double smart quotes → "
+    .replace(/[\u2014]/g, '--')   // em dash → double dash (SQL comment)
+    .replace(/[\u2013]/g, '-')    // en dash → hyphen
+}
+
 const BitLab = ({
   sessions,
   setSessions,
@@ -197,10 +205,13 @@ const BitLab = ({
   const runQuery = useCallback((codeOverride?: string) => {
     const session = sessions.find((s) => s.id === activeId);
     if (!session) return;
-    const code = (codeOverride ?? session.code).trim();
-    if (!code) return;
+    const raw = (codeOverride ?? session.code).trim();
+    if (!raw) return;
+
+    const code = normalizeQuotes(raw);
 
     const db = dbMapRef.current.get(activeId);
+
     if (!db) {
       setMessages([{ type: "error", text: "Database not initialized for this session." }]);
       return;
