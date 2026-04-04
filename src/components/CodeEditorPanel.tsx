@@ -6,7 +6,7 @@ import { detectMode } from "@/lib/keywords";
 interface CodeEditorPanelProps {
   session: Session;
   sessions: Session[];
-  messages?: Array<{ type: "success" | "error" | "info"; text: string }>;
+  messages?: Array<{ type: "success" | "error" | "info" | "dbms"; text: string }>;
   output?: string | null;
   onCodeChange: (code: string) => void;
   onModeChange: (mode: "SQL" | "PL/SQL") => void;
@@ -338,6 +338,8 @@ const CodeEditorPanel = ({
                           ? "border-l-2 border-l-red-500 text-red-500"
                           : m.type === "success"
                           ? "border-l-2 border-l-green-500 text-green-500"
+                          : m.type === "dbms"
+                          ? "border-l-2 border-l-accent text-accent"
                           : "border-l-2 border-border text-muted-foreground"
                       }`}
                     >

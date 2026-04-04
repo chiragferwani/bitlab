@@ -121,6 +121,73 @@ function assignVariable(
   }
 }
 
+/**
+ * Resolves a PL/SQL expression to a string, handling concatenation with ||.
+ */
+function resolveStringExpression(
+  expr: string,
+  ctx: ExecutionContext
+): string {
+  const trimmed = expr.trim();
+  if (!trimmed) return "";
+
+  // Handle || concatenation
+  if (trimmed.includes("||")) {
+    const parts = splitByOperator(trimmed, "||");
+    return parts.map((p) => String(evaluateExpression(p, ctx) ?? "")).join("");
+  }
+
+  // Check if it's already a string literal
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1).replace(/''/g, "'");
+  }
+
+  // Otherwise evaluate normally
+  return String(evaluateExpression(trimmed, ctx) ?? "");
+}
+
+/**
+ * Substitutes variables from the execution context into an SQL string.
+ * Handles both simple variables and record.field notation.
+ */
+function substituteContextVariables(
+  sql: string,
+  ctx: ExecutionContext
+): string {
+  let result = sql;
+
+  // 1. Handle record.field notation (rec.roll, rec.att)
+  // These are handled first to avoid partial replacement by simple record variables if they exist
+  result = result.replace(/\b(\w+)\.(\w+)\b/g, (match, obj, field) => {
+    const recordVar = ctx.getVar(obj);
+    if (recordVar && typeof recordVar === "object") {
+      const val = (recordVar as any)[field.toUpperCase()] ?? (recordVar as any)[field.toLowerCase()] ?? (recordVar as any)[field];
+      if (val !== undefined) {
+        return typeof val === "string" ? `'${val}'` : String(val);
+      }
+    }
+    return match;
+  });
+
+  // 2. Handle regular variable substitution
+  // Sorted by length descending to avoid partial matches
+  const varNames = Array.from(ctx.variables.keys()).sort((a, b) => b.length - a.length);
+  for (const name of varNames) {
+    const v = ctx.variables.get(name);
+    if (!v || v.value === null || v.value === undefined) continue;
+    if (typeof v.value === "object") continue; // Skip objects (records)
+
+    const re = new RegExp(`\\b${name}\\b`, "gi");
+    if (typeof v.value === "string") {
+      result = result.replace(re, `'${v.value}'`);
+    } else {
+      result = result.replace(re, String(v.value));
+    }
+  }
+
+  return result;
+}
+
 function evaluateBetween(value: any, low: any, high: any): boolean {
   return Number(value) >= Number(low) && Number(value) <= Number(high);
 }
@@ -669,8 +736,8 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
     // ── DBMS_OUTPUT.PUT_LINE ──
     const putLineMatch = line.match(/^DBMS_OUTPUT\.PUT_LINE\s*\(([\s\S]*)\)$/i);
     if (putLineMatch) {
-      const val = evaluateExpression(putLineMatch[1], ctx);
-      ctx.dbmsOutput.push(String(val ?? ""));
+      const val = resolveStringExpression(putLineMatch[1], ctx);
+      ctx.dbmsOutput.push(val);
       i++;
       continue;
     }
@@ -690,10 +757,14 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
       continue;
     }
 
-    // ── FOR loop ──
+    // ── FOR loop (Numeric or Cursor) ──
     const forMatch = upper.match(/^FOR\s+(\w+)\s+IN\s+(REVERSE\s+)?(.+?)\.\.(.+?)\s+LOOP$/i);
+    const cursorForMatch = upper.match(/^FOR\s+(\w+)\s+IN\s+(\w+)\s+LOOP$/i);
     if (forMatch) {
       i = executeForLoop(lines, i, forMatch, ctx);
+      continue;
+    } else if (cursorForMatch) {
+      i = executeCursorForLoop(lines, i, cursorForMatch, ctx);
       continue;
     }
 
@@ -742,7 +813,7 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
       const cursorName = (openParamMatch ? openParamMatch[1] : openSimpleMatch![1]).toUpperCase();
       const cursor = ctx.cursors.get(cursorName);
       if (cursor) {
-        let query = cursor.query;
+        let query = substituteContextVariables(cursor.query, ctx);
 
         // If opened with parameters, substitute cursor param names with resolved argument values
         if (openParamMatch && cursor.params.length > 0) {
@@ -750,19 +821,7 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
           cursor.params.forEach((param, idx) => {
             if (idx < argStrs.length) {
               const argExpr = argStrs[idx].trim();
-              // Resolve the argument: it could be a variable name or a literal
-              let resolved: unknown = argExpr;
-              // Check if it's a variable reference
-              if (ctx.hasVar(argExpr)) {
-                resolved = ctx.getVar(argExpr);
-              } else if (/^-?\d+(\.\d+)?$/.test(argExpr)) {
-                resolved = parseFloat(argExpr);
-              } else if (argExpr.startsWith("'") && argExpr.endsWith("'")) {
-                resolved = argExpr.slice(1, -1);
-              } else {
-                // Try evaluating as expression
-                resolved = evaluateExpression(argExpr, ctx);
-              }
+              let resolved: unknown = evaluateExpression(argExpr, ctx);
 
               // Replace all occurrences of the cursor parameter name in the SQL
               const paramRegex = new RegExp(`\\b${param.name}\\b`, 'gi');
@@ -775,15 +834,6 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
           });
         }
 
-        // Also resolve any remaining context variables in the query
-        for (const [varName, variable] of ctx.variables) {
-          const re = new RegExp(`\\b${varName}\\b`, "gi");
-          if (typeof variable.value === "string") {
-            query = query.replace(re, `'${variable.value}'`);
-          } else if (variable.value !== null && variable.value !== undefined) {
-            query = query.replace(re, String(variable.value));
-          }
-        }
         try {
           const result = ctx.db.exec(translateOracleSql(query));
           if (result.length > 0) {
@@ -863,8 +913,9 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
       const fromClause = selectIntoMatch[3];
 
       // Build a real SELECT query without INTO
-      const query = `SELECT ${selectCols} FROM ${fromClause}`;
+      const rawQuery = `SELECT ${selectCols} FROM ${fromClause}`;
       try {
+        const query = substituteContextVariables(rawQuery, ctx);
         const result = ctx.db.exec(translateOracleSql(query));
         if (result.length === 0 || result[0].values.length === 0) {
           throw new Error("NO_DATA_FOUND");
@@ -890,15 +941,7 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
       const merged = collectStatement(lines, i);
       try {
         // Resolve variables in the DML statement
-        let query = merged.statement;
-        for (const [varName, variable] of ctx.variables) {
-          const re = new RegExp(`\\b${varName}\\b`, "gi");
-          if (typeof variable.value === "string") {
-            query = query.replace(re, `'${variable.value}'`);
-          } else if (variable.value !== null && variable.value !== undefined) {
-            query = query.replace(re, String(variable.value));
-          }
-        }
+        const query = substituteContextVariables(merged.statement, ctx);
         ctx.db.run(translateOracleSql(query));
         const rows = ctx.db.getRowsModified();
         ctx.setVar("SQL%ROWCOUNT", rows);
@@ -1418,6 +1461,67 @@ export function executePLSQL(
   messages.push({ type: "info", text: `Executed in ${elapsed}s` });
 
   return { output, messages, sqlOutput, rawResult };
+}
+
+// ── Cursor FOR Loop ───────────────────────────────────────────────────
+
+function executeCursorForLoop(
+  lines: string[], startIdx: number,
+  match: RegExpMatchArray, ctx: ExecutionContext
+): number {
+  const recordVarName = match[1].toUpperCase();
+  const cursorName = match[2].toUpperCase();
+
+  const cursor = ctx.cursors.get(cursorName);
+  if (!cursor) throw new Error(`Cursor ${cursorName} not declared`);
+
+  // Execute cursor query
+  const query = substituteContextVariables(cursor.query, ctx);
+  let rows: any[] = [];
+  try {
+    const result = ctx.db.exec(translateOracleSql(query));
+    if (result.length > 0) {
+      const columns = result[0].columns;
+      rows = result[0].values.map((row) => {
+        const obj: any = {};
+        columns.forEach((col, idx) => {
+          obj[col.toUpperCase()] = row[idx];
+          obj[col.toLowerCase()] = row[idx];
+          obj[col] = row[idx];
+        });
+        return obj;
+      });
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Cursor ${cursorName} execution failed: ${toOracleErrorText(msg)}`);
+  }
+
+  // Collect loop body lines
+  let i = startIdx + 1;
+  const bodyLines: string[] = [];
+  let depth = 0;
+  while (i < lines.length) {
+    const upper = lines[i].trim().toUpperCase();
+    if (/\bLOOP\s*$/.test(upper)) depth++;
+    if (/^END\s+LOOP\s*;?\s*$/i.test(lines[i].trim())) {
+      if (depth > 0) { depth--; bodyLines.push(lines[i]); }
+      else { i++; break; }
+    } else {
+      bodyLines.push(lines[i]);
+    }
+    i++;
+  }
+
+  // Loop iteration
+  for (const row of rows) {
+    ctx.setVar(recordVarName, row); // Store entire row object
+    ctx.exitLoop = false;
+    executeBody([...bodyLines], ctx);
+    if (ctx.exitLoop || ctx.hasReturned) { ctx.exitLoop = false; break; }
+  }
+
+  return i;
 }
 
 // ── Exception Handler ──────────────────────────────────────────────────

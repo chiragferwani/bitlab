@@ -32,7 +32,7 @@ interface BitLabProps {
 
 function inferActiveDatabaseNameFromMessages(
   currentName: string,
-  messages: Array<{ type: "success" | "error" | "info"; text: string }>
+  messages: Array<{ type: "success" | "error" | "info" | "dbms"; text: string }>
 ): string {
   let nextName = currentName;
   for (const message of messages) {
@@ -70,7 +70,7 @@ const BitLab = ({
   introspectSchema,
 }: BitLabProps) => {
   const [output, setOutput] = useState<string | null>(null);
-  const [messages, setMessages] = useState<Array<{ type: "success" | "error" | "info"; text: string }>>([]);
+  const [messages, setMessages] = useState<Array<{ type: "success" | "error" | "info" | "dbms"; text: string }>>([]);
   const [bootVisible, setBootVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(200);
   const [outputWidth, setOutputWidth] = useState(340);
@@ -237,7 +237,19 @@ const BitLab = ({
           setOutput(null);
           setRawResult(null);
         }
-        setMessages((prev) => [...prev, ...result.messages]);
+
+        // Flush DBMS_OUTPUT to messages panel as well
+        if (result.output.length > 0) {
+          const dbmsMessages = result.output.map((line) => ({
+            type: "dbms" as const,
+            text: `DBMS_OUTPUT: ${line}`,
+          }));
+          setMessages((prev) => [...prev, ...dbmsMessages]);
+        }
+
+        if (result.messages.length > 0) {
+          setMessages((prev) => [...prev, ...result.messages]);
+        }
       } else {
         // SQL execution
         const currentDatabaseName = databaseNameMapRef.current.get(activeId) || "session";
