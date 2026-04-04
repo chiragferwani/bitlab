@@ -28,9 +28,15 @@ interface Variable {
   value: unknown;
 }
 
+interface CursorParam {
+  name: string;
+  type: string;
+}
+
 interface CursorDef {
   name: string;
   query: string;
+  params: CursorParam[];
   rows: unknown[][] | null;
   columns: string[] | null;
   position: number;
@@ -436,13 +442,94 @@ function collectBlock(lines: string[], startIdx: number, endKeyword: RegExp): { 
 
 // ── DECLARE Section Parser ─────────────────────────────────────────────
 
+/**
+ * Resolves a column's type from the database schema for %TYPE declarations.
+ */
+function resolvePercentType(
+  table: string,
+  column: string,
+  db: Database
+): string {
+  try {
+    const result = db.exec(`PRAGMA table_info(${table})`);
+    if (result.length > 0) {
+      const col = result[0].values.find(
+        (row: any[]) => row[1].toString().toLowerCase() === column.toLowerCase()
+      );
+      if (col) {
+        const type = String(col[2]).toUpperCase();
+        if (type.includes('NUMBER') || type.includes('INT') ||
+            type.includes('FLOAT') || type.includes('REAL') ||
+            type.includes('DECIMAL') || type.includes('NUMERIC')) {
+          return 'NUMBER';
+        }
+        if (type.includes('DATE')) return 'DATE';
+        return 'VARCHAR2';
+      }
+    }
+  } catch {}
+  return 'NUMBER'; // default to NUMBER if lookup fails
+}
+
 function parseDeclareSection(lines: string[], ctx: ExecutionContext) {
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i].trim();
     const line = raw.replace(/;$/, "").trim();
     if (!line || line.toUpperCase() === "DECLARE") continue;
 
-    // Cursor declaration: CURSOR c1 IS SELECT ...
+    // Cursor declaration with parameters: CURSOR c1(p1 TYPE, p2 TYPE) IS SELECT ...
+    const cursorParamMatch = raw.match(/^CURSOR\s+(\w+)\s*\(([^)]+)\)\s+IS\b([\s\S]*)$/i);
+    if (cursorParamMatch) {
+      const cursorName = cursorParamMatch[1].toUpperCase();
+      const paramsStr = cursorParamMatch[2];
+      const cursorParams: CursorParam[] = [];
+
+      // Parse parameter list: p_dno NUMBER, p_name VARCHAR2, etc.
+      const paramParts = paramsStr.split(',');
+      for (const p of paramParts) {
+        const pm = p.trim().match(/^(\w+)\s+(\w+(?:\([^)]*\))?)$/i);
+        if (pm) {
+          cursorParams.push({ name: pm[1].toUpperCase(), type: pm[2].toUpperCase() });
+        }
+      }
+
+      const queryParts: string[] = [];
+      let j = i;
+
+      const firstTail = (cursorParamMatch[3] || "").trim().replace(/;$/, "");
+      if (firstTail) {
+        queryParts.push(firstTail);
+      }
+
+      if (!raw.endsWith(";")) {
+        j = i + 1;
+        while (j < lines.length) {
+          const partRaw = lines[j].trim();
+          if (!partRaw) {
+            j++;
+            continue;
+          }
+          queryParts.push(partRaw.replace(/;$/, "").trim());
+          if (partRaw.endsWith(";")) break;
+          j++;
+        }
+      }
+
+      ctx.cursors.set(cursorName, {
+        name: cursorName,
+        query: queryParts.join(" ").trim(),
+        params: cursorParams,
+        rows: null,
+        columns: null,
+        position: 0,
+        isOpen: false,
+        lastFetchFound: false,
+      });
+      i = j;
+      continue;
+    }
+
+    // Cursor declaration without parameters: CURSOR c1 IS SELECT ...
     const cursorMatch = raw.match(/^CURSOR\s+(\w+)\s+IS\b([\s\S]*)$/i);
     if (cursorMatch) {
       const cursorName = cursorMatch[1].toUpperCase();
@@ -471,6 +558,7 @@ function parseDeclareSection(lines: string[], ctx: ExecutionContext) {
       ctx.cursors.set(cursorName, {
         name: cursorName,
         query: queryParts.join(" ").trim(),
+        params: [],
         rows: null,
         columns: null,
         position: 0,
@@ -485,8 +573,11 @@ function parseDeclareSection(lines: string[], ctx: ExecutionContext) {
     const typeRefMatch = line.match(/^(\w+)\s+(\w+)\.(\w+)%TYPE\s*(:=\s*(.*))?$/i);
     if (typeRefMatch) {
       const varName = typeRefMatch[1].toUpperCase();
+      const tableName = typeRefMatch[2];
+      const colName = typeRefMatch[3];
+      const resolvedType = resolvePercentType(tableName, colName, ctx.db);
       const defaultVal = typeRefMatch[5] ? evaluateExpression(typeRefMatch[5], ctx) : null;
-      ctx.variables.set(varName, { name: varName, type: "VARCHAR2", value: defaultVal });
+      assignVariable(ctx.variables, varName, defaultVal, resolvedType);
       continue;
     }
 
@@ -644,14 +735,47 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
       continue;
     }
 
-    // ── OPEN cursor ──
-    const openMatch = line.match(/^OPEN\s+(\w+)$/i);
-    if (openMatch) {
-      const cursorName = openMatch[1].toUpperCase();
+    // ── OPEN cursor (with or without parameters) ──
+    const openParamMatch = line.match(/^OPEN\s+(\w+)\s*\(([^)]+)\)$/i);
+    const openSimpleMatch = line.match(/^OPEN\s+(\w+)$/i);
+    if (openParamMatch || openSimpleMatch) {
+      const cursorName = (openParamMatch ? openParamMatch[1] : openSimpleMatch![1]).toUpperCase();
       const cursor = ctx.cursors.get(cursorName);
       if (cursor) {
-        // Resolve variables in query
         let query = cursor.query;
+
+        // If opened with parameters, substitute cursor param names with resolved argument values
+        if (openParamMatch && cursor.params.length > 0) {
+          const argStrs = splitFunctionArgs(openParamMatch[2]);
+          cursor.params.forEach((param, idx) => {
+            if (idx < argStrs.length) {
+              const argExpr = argStrs[idx].trim();
+              // Resolve the argument: it could be a variable name or a literal
+              let resolved: unknown = argExpr;
+              // Check if it's a variable reference
+              if (ctx.hasVar(argExpr)) {
+                resolved = ctx.getVar(argExpr);
+              } else if (/^-?\d+(\.\d+)?$/.test(argExpr)) {
+                resolved = parseFloat(argExpr);
+              } else if (argExpr.startsWith("'") && argExpr.endsWith("'")) {
+                resolved = argExpr.slice(1, -1);
+              } else {
+                // Try evaluating as expression
+                resolved = evaluateExpression(argExpr, ctx);
+              }
+
+              // Replace all occurrences of the cursor parameter name in the SQL
+              const paramRegex = new RegExp(`\\b${param.name}\\b`, 'gi');
+              if (typeof resolved === 'string') {
+                query = query.replace(paramRegex, `'${resolved}'`);
+              } else {
+                query = query.replace(paramRegex, String(resolved ?? 'NULL'));
+              }
+            }
+          });
+        }
+
+        // Also resolve any remaining context variables in the query
         for (const [varName, variable] of ctx.variables) {
           const re = new RegExp(`\\b${varName}\\b`, "gi");
           if (typeof variable.value === "string") {
@@ -690,7 +814,21 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
       if (cursor && cursor.rows && cursor.position < cursor.rows.length) {
         const row = cursor.rows[cursor.position];
         for (let j = 0; j < varNames.length && j < row.length; j++) {
-          ctx.setVar(varNames[j], row[j] === null ? null : row[j]);
+          const rawValue = row[j];
+          const targetVar = ctx.variables.get(varNames[j].toUpperCase());
+          if (targetVar) {
+            // Coerce fetched value to match the declared type of the target variable
+            const declaredType = targetVar.type.toUpperCase();
+            const numericTypes = ['NUMBER', 'INTEGER', 'INT', 'FLOAT', 'DECIMAL', 'NUMERIC'];
+            if (numericTypes.some(t => declaredType.startsWith(t))) {
+              const coerced = rawValue === null || rawValue === undefined ? 0 : Number(rawValue);
+              ctx.setVar(varNames[j], isNaN(coerced) ? 0 : coerced);
+            } else {
+              ctx.setVar(varNames[j], rawValue === null ? null : rawValue);
+            }
+          } else {
+            ctx.setVar(varNames[j], rawValue === null ? null : rawValue);
+          }
         }
         cursor.position++;
         cursor.lastFetchFound = true;

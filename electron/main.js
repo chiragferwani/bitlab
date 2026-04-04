@@ -38,11 +38,20 @@ function createWindow() {
   if (isDev) {
     mainWindow.loadURL(process.env.ELECTRON_DEV_URL);
   } else {
-    mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+    const indexPath = path.join(__dirname, "..", "dist", "index.html");
+    // Set working directory so relative asset paths (including WASM) resolve on Windows
+    process.chdir(path.join(__dirname, "..", "dist"));
+    mainWindow.loadFile(indexPath);
   }
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  // Set app name explicitly for Linux taskbar/dock
+  if (process.platform === "linux") {
+    app.setName("BitLab");
+  }
+  createWindow();
+});
 
 app.on("window-all-closed", () => {
   app.quit();
