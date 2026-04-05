@@ -124,7 +124,8 @@
     ],
     "win": {
       "target": [
-        "portable"
+        "portable",
+        "zip"
       ],
       "icon": "assets/icons/icon.ico",
       "artifactName": "BitLab-${version}-windows.${ext}",

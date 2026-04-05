@@ -74,15 +74,13 @@ React UI (TopBar / Sidebar / Editor / Output)
         v
 Mode Detection (keywords.ts)
         |
-        +--> SQL path ---------> sqlEngine.ts ---------> sql.js Database
+        +--[SQL / PL·SQL]-----> sqlEngine.ts / plsqlInterpreter.ts --> sql.js Database
         |
-        +--> PL/SQL path ------> plsqlInterpreter.ts --> sql.js Database
-                                                |
-                                                +--> executeSQL(...) for prelude/trailing SQL
+        +--[MONGODB]----------> mongoEngine.ts ----------------------> mingo (In-Memory)
 
-Schema Introspection (database.ts) ---> SchemaExplorer
-Formatted Table/CSV (tableFormatter.ts) ---> Output Console
-SQLite Error Mapping (oracleErrors.ts) ---> Oracle-style messages
+Schema Introspection (database.ts / mongoEngine.ts) ---> SchemaExplorer
+Result Formatting (tableFormatter.ts / OutputConsole.tsx) ---> Output Console
+Error Mapping (oracleErrors.ts) ---> Oracle / MongoDB error messages
 ```
 
 ---
