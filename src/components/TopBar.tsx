@@ -6,9 +6,11 @@ interface TopBarProps {
   onDelete: () => void;
   canDelete: boolean;
   bootVisible: boolean;
+  mode: "SQL" | "PL/SQL" | "MONGODB";
+  onModeChange: (mode: "SQL" | "PL/SQL" | "MONGODB") => void;
 }
 
-const TopBar = ({ onDelete, canDelete, bootVisible }: TopBarProps) => {
+const TopBar = ({ onDelete, canDelete, bootVisible, mode, onModeChange }: TopBarProps) => {
   const [isDark, setIsDark] = useState(true);
 
   useEffect(() => {
@@ -34,6 +36,20 @@ const TopBar = ({ onDelete, canDelete, bootVisible }: TopBarProps) => {
         )}
       </div>
       <div className="flex items-center gap-3">
+        <div className="flex bg-muted rounded-md p-1 items-center">
+            <button
+                onClick={() => onModeChange("SQL")}
+                className={`text-[10px] px-3 py-1 rounded-sm transition-all ${mode !== "MONGODB" ? "bg-accent/60 text-accent-foreground shadow-sm font-semibold" : "text-muted-foreground hover:text-foreground"}`}
+            >
+                SQL / PL·SQL
+            </button>
+            <button
+                onClick={() => onModeChange("MONGODB")}
+                className={`text-[10px] px-3 py-1 rounded-sm transition-all ${mode === "MONGODB" ? "bg-accent/60 text-accent-foreground shadow-sm font-semibold" : "text-muted-foreground hover:text-foreground"}`}
+            >
+                MongoDB
+            </button>
+        </div>
         <button
           onClick={() => setIsDark(!isDark)}
           className="text-xs text-muted-foreground hover:text-foreground transition-colors px-2 py-1"

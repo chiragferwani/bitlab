@@ -11,12 +11,13 @@ import { executeSQL } from "@/lib/sqlEngine";
 import { executePLSQL } from "@/lib/plsqlInterpreter";
 import { detectMode } from "@/lib/keywords";
 import { formatCsv, formatTable } from "@/lib/tableFormatter";
+import { MongoEngine } from "@/lib/mongoEngine";
 
 export interface Session {
   id: string;
   name: string;
   code: string;
-  mode: "SQL" | "PL/SQL";
+  mode: "SQL" | "PL/SQL" | "MONGODB";
 }
 
 interface BitLabProps {
@@ -27,6 +28,7 @@ interface BitLabProps {
   dbMapRef: MutableRefObject<Map<string, Database>>;
   procsMapRef: MutableRefObject<Map<string, Map<string, any>>>;
   databaseNameMapRef: MutableRefObject<Map<string, string>>;
+  mongoMapRef: MutableRefObject<Map<string, MongoEngine>>;
   introspectSchema: (db: Database) => SchemaTableInfo[];
 }
 
@@ -67,6 +69,7 @@ const BitLab = ({
   dbMapRef,
   procsMapRef,
   databaseNameMapRef,
+  mongoMapRef,
   introspectSchema,
 }: BitLabProps) => {
   const [output, setOutput] = useState<string | null>(null);
@@ -99,6 +102,25 @@ const BitLab = ({
   };
 
   const refreshSchema = (sessionId: string) => {
+    const session = sessions.find(s => s.id === sessionId);
+    if (session?.mode === "MONGODB") {
+      const mongo = mongoMapRef.current.get(sessionId);
+      if (!mongo) {
+          setSchemaDatabases([]);
+          return;
+      }
+      const collections = mongo.getCollections();
+      // We'll adapt SchemaDatabase to show Collections as tables
+      setSchemaDatabases([{
+          name: "COLLECTIONS",
+          tables: collections.map(c => ({
+              name: c.name,
+              columns: [{ name: `${c.count} docs`, type: "" }]
+          }))
+      }]);
+      return;
+    }
+
     const db = dbMapRef.current.get(sessionId);
     if (!db) {
       setSchemaDatabases([]);
@@ -123,6 +145,7 @@ const BitLab = ({
     dbMapRef.current.set(newId, db);
     procsMapRef.current.set(newId, new Map());
     databaseNameMapRef.current.set(newId, "session");
+    mongoMapRef.current.set(newId, new MongoEngine());
     setSessions((prev) => [...prev, newSession]);
     setActiveId(newId);
     setSelectedTableKey(null);
@@ -142,7 +165,8 @@ const BitLab = ({
       dbMapRef.current.delete(activeId);
     }
     procsMapRef.current.delete(activeId);
-    databaseNameMapRef.current.delete(activeId);
+    databaseNameMapRef.current.set(activeId, "session"); // or delete it? the original code has .delete but let's be safe
+    mongoMapRef.current.delete(activeId);
     const remaining = sessions.filter((s) => s.id !== activeId);
     setSessions(remaining);
     setActiveId(remaining[0].id);
@@ -220,23 +244,35 @@ const BitLab = ({
     const mode = detectMode(code);
 
     try {
-      if (mode === "PL/SQL") {
+      if (mode === "MONGODB") {
+          const mongo = mongoMapRef.current.get(activeId);
+          if (!mongo) throw new Error("Mongo engine not initialized");
+          const result = mongo.execute(code);
+          if (result.type === "error") {
+              setMessages(prev => [...prev, { type: "error", text: result.message! }]);
+          } else if (result.type === "documents" || result.type === "document") {
+              const docs = result.type === "documents" ? result.documents : [result.document];
+              setOutput(JSON.stringify(docs, null, 2));
+              setMessages(prev => [...prev, { type: "success", text: `${result.count || (result.document ? 1 : 0)} documents returned.` }]);
+          } else {
+              setOutput(result.message || "Command acknowledged.");
+              setMessages(prev => [...prev, { type: "success", text: result.message || "Success." }]);
+          }
+      } else if (mode === "PL/SQL") {
         // PL/SQL execution
         const procs = procsMapRef.current.get(activeId) || new Map();
         const result = executePLSQL(db, code, procs);
         procsMapRef.current.set(activeId, procs);
 
-        if (result.sqlOutput) {
-          setOutput(result.sqlOutput);
-          setRawResult(result.rawResult ?? null);
-        } else if (result.output.length > 0) {
-          // Display DBMS_OUTPUT lines in the output panel when no SQL result set exists
-          setOutput("DBMS_OUTPUT:\n" + result.output.join("\n"));
-          setRawResult(null);
-        } else {
-          setOutput(null);
-          setRawResult(null);
+        let finalOutput = "";
+        if (result.output.length > 0) {
+          finalOutput += "DBMS_OUTPUT:\n" + result.output.join("\n") + "\n\n";
         }
+        if (result.sqlOutput) {
+          finalOutput += result.sqlOutput;
+        }
+        setOutput(finalOutput.trim() || null);
+        setRawResult(result.rawResult ?? null);
 
         // Flush DBMS_OUTPUT to messages panel as well
         if (result.output.length > 0) {
@@ -312,7 +348,13 @@ const BitLab = ({
 
   return (
     <div className="flex flex-col h-screen bg-background text-foreground overflow-hidden">
-      <TopBar onDelete={deleteSession} canDelete={sessions.length > 1} bootVisible={bootVisible} />
+      <TopBar
+        onDelete={deleteSession}
+        canDelete={sessions.length > 1}
+        bootVisible={bootVisible}
+        mode={activeSession.mode}
+        onModeChange={(mode) => updateSession(activeId, { mode })}
+      />
       <div className="flex flex-1 overflow-hidden">
         <div style={{ width: sidebarWidth, minWidth: 140 }} className="flex-shrink-0">
           <SessionSidebar
@@ -352,6 +394,7 @@ const BitLab = ({
             onClear={handleClear}
             onExportCsv={handleExportCsv}
             hasRawResult={rawResult !== null}
+            mode={activeSession.mode}
           />
         </div>
       </div>

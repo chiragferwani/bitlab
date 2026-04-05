@@ -6,9 +6,10 @@ interface OutputConsoleProps {
   onClear: () => void;
   onExportCsv: () => void;
   hasRawResult: boolean;
+  mode: "SQL" | "PL/SQL" | "MONGODB";
 }
 
-const OutputConsole = ({ output, onClear, onExportCsv, hasRawResult }: OutputConsoleProps) => {
+const OutputConsole = ({ output, onClear, onExportCsv, hasRawResult, mode }: OutputConsoleProps) => {
   const [copyLabel, setCopyLabel] = useState("Copy");
   const [toastVisible, setToastVisible] = useState(false);
 
@@ -53,9 +54,28 @@ const OutputConsole = ({ output, onClear, onExportCsv, hasRawResult }: OutputCon
         {/* Results */}
         <div className="flex-1 overflow-auto custom-scrollbar p-3">
           {output ? (
-            <pre className="font-mono-code text-xs text-foreground whitespace-pre leading-relaxed">
-              {output}
-            </pre>
+            mode === "MONGODB" ? (
+              <div className="font-mono-code text-[11px] leading-6 space-y-0.5">
+                {output.split("\n").map((line, i) => {
+                  const highlighted = line
+                    .replace(/"(\w+)":/g, '<span class="text-[#f1fa8c]">"$1"</span>:') // keys
+                    .replace(/: "(.*)"/g, ': <span class="text-[#50fa7b]">"$1"</span>') // strings
+                    .replace(/: (\d+)/g, ': <span class="text-[#ffb86c]">$1</span>') // numbers
+                    .replace(/: (true|false|null)/g, ': <span class="text-[#bd93f9]">$1</span>'); // bools
+                  return (
+                    <div
+                      key={i}
+                      className="hover:bg-sidebar-accent/30 rounded pl-1"
+                      dangerouslySetInnerHTML={{ __html: highlighted || line }}
+                    />
+                  );
+                })}
+              </div>
+            ) : (
+              <pre className="font-mono-code text-xs text-foreground whitespace-pre leading-relaxed">
+                {output}
+              </pre>
+            )
           ) : (
             <div className="flex items-center justify-center h-full">
               <span className="text-xs text-muted-foreground">

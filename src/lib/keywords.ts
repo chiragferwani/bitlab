@@ -31,6 +31,19 @@ const PLSQL_KEYWORDS: string[] = [
   "RAISE", "PRAGMA", "AUTONOMOUS_TRANSACTION",
 ];
 
+const MONGO_KEYWORDS: string[] = [
+  "db", "find", "findOne", "insertOne", "insertMany",
+  "updateOne", "updateMany", "deleteOne", "deleteMany",
+  "aggregate", "countDocuments", "drop", "createCollection",
+  "show collections", "show dbs",
+  "$set", "$unset", "$inc", "$push", "$pull", "$match",
+  "$group", "$sort", "$limit", "$skip", "$project",
+  "$sum", "$avg", "$min", "$max", "$count",
+  "$eq", "$ne", "$gt", "$gte", "$lt", "$lte",
+  "$in", "$nin", "$and", "$or", "$not", "$exists",
+  "ObjectId", "ISODate", "NumberInt", "NumberLong"
+];
+
 const BUILTIN_FUNCTIONS: string[] = [
   "COUNT", "SUM", "AVG", "MAX", "MIN", "UPPER", "LOWER", "LENGTH",
   "SUBSTR", "TRIM", "LTRIM", "RTRIM", "REPLACE", "INSTR",
@@ -46,6 +59,7 @@ export const ALL_KEYWORDS: KeywordEntry[] = [
   ...SQL_KEYWORDS.map((w) => ({ word: w, category: "keyword" as const })),
   ...PLSQL_KEYWORDS.map((w) => ({ word: w, category: "keyword" as const })),
   ...BUILTIN_FUNCTIONS.map((w) => ({ word: w, category: "function" as const })),
+  ...MONGO_KEYWORDS.map((w) => ({ word: w, category: "keyword" as const })),
 ];
 
 // Deduplicate by word (keep first occurrence)
@@ -70,8 +84,11 @@ export const PLSQL_DETECT_PATTERNS = [
 ];
 
 /**
- * Detects whether code is PL/SQL or plain SQL.
+ * Detects whether code is PL/SQL, MongoDB or plain SQL.
  */
-export function detectMode(code: string): "SQL" | "PL/SQL" {
+export function detectMode(code: string): "SQL" | "PL/SQL" | "MONGODB" {
+  if (/^db\.\w+/i.test(code.trim()) || /^show\s+(collections|dbs)/i.test(code.trim())) {
+    return "MONGODB";
+  }
   return PLSQL_DETECT_PATTERNS.some((p) => p.test(code)) ? "PL/SQL" : "SQL";
 }

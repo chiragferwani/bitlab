@@ -29,9 +29,10 @@ It provides:
 - A multi-session query workspace with isolated in-memory databases.
 - SQL execution with Oracle-style translation and error mapping.
 - A custom PL/SQL interpreter for syllabus-oriented constructs.
-- Live schema explorer per session.
-- Output console with copy + CSV export.
-- Auto mode detection (`SQL` vs `PL/SQL`) and editor autocomplete.
+- Live schema explorer per session with MongoDB collection support.
+- Output console with copy + CSV export and JSON syntax highlighting.
+- Auto mode detection (`SQL`, `PL/SQL`, `MONGODB`) and editor autocomplete.
+- Support for dynamic SQL via `EXECUTE IMMEDIATE`.
 
 The app is optimized for classroom/lab usage where users need Oracle-like ergonomics without provisioning Oracle.
 
@@ -55,9 +56,10 @@ The app is optimized for classroom/lab usage where users need Oracle-like ergono
 | Editor UX | Monospace editor, line numbers, cursor position, run shortcuts, run selection |
 | Autocomplete | Keyword/function suggestions from SQL + PL/SQL dictionaries |
 | Execution Engine | Statement splitter, Oracle-to-SQLite translation, synthetic command handling |
-| PL/SQL Runtime | Variables, loops, IF/ELSIF/ELSE, cursors, SELECT INTO, procedures/functions, exception blocks |
-| Schema Explorer | Auto-refreshed table + column introspection from `sqlite_master` + `PRAGMA table_info` |
-| Result Handling | ASCII table rendering, message stream, DBMS_OUTPUT rendering |
+| PL/SQL Runtime | Variables, loops, IF/ELSIF/ELSE, cursors, SELECT INTO, procedures/functions, exception blocks, EXECUTE IMMEDIATE |
+| MongoDB Engine | In-browser NoSQL simulation, CRUD operations, aggregation pipeline, collection explorer |
+| Schema Explorer | Auto-refreshed table + column introspection for SQL; Collection + count view for MongoDB |
+| Result Handling | ASCII table rendering, message stream, DBMS_OUTPUT rendering, JSON document view |
 | Export/Copy | Copy output to clipboard, export result set as CSV |
 | Theme System | Dark/light toggle with CSS variable-driven tokens |
 
@@ -109,11 +111,12 @@ This means data/schema changes in one session do not affect others.
 When user runs code:
 
 1. Current text (or selected/current statement) is read from editor.
-2. Mode is detected using regex patterns (`DECLARE`, `BEGIN`, `CREATE PROCEDURE`, etc.).
+2. Mode is detected using regex patterns (`DECLARE`, `BEGIN`, `db.collection`, etc.).
 3. SQL mode -> `executeSQL(...)`
 4. PL/SQL mode -> `executePLSQL(...)`
-5. Messages, result table, and raw result payload are stored in state.
-6. Schema is re-introspected and sidebar updates.
+5. MONGODB mode -> `mongoEngine.execute(...)`
+6. Messages, result table (SQL) or JSON (MongoDB), and raw result payload are stored in state.
+7. Schema is re-introspected and sidebar updates.
 
 ### 4) Output Delivery
 
@@ -202,7 +205,30 @@ Interpreter supports mixed scripts:
 - SQL prelude before first PL/SQL block is executed through `executeSQL`.
 - Trailing SQL after PL/SQL block is also executed through `executeSQL`.
 
-This allows realistic lab-style scripts with setup + block + validation query in one run.
+---
+
+## MongoDB Engine Details (`src/lib/mongoEngine.ts`)
+
+BitLab v1.2 introduces a browser-side MongoDB simulation engine powered by `mingo`.
+
+### Supported Operations
+
+- `db.collection.insertOne()`, `insertMany()`
+- `db.collection.find()`, `findOne()`
+- `db.collection.updateOne()`, `updateMany()`
+- `db.collection.deleteOne()`, `deleteMany()`
+- `db.collection.aggregate()`
+- `db.collection.countDocuments()`
+- `db.collection.drop()`
+- `db.createCollection()`
+- `show collections`
+
+### Features
+
+- Local-first in-memory storage per session.
+- Full MongoDB Query Language (MQL) support via `mingo`.
+- Automatic collection creation on first insert.
+- Document-level syntax highlighting in the Output Console.
 
 ---
 

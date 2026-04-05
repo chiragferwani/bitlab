@@ -11,7 +11,7 @@
 
 import type { Database } from "sql.js";
 import { mapSqliteError } from "./oracleErrors";
-import { executeSQL, translateOracleSql } from "./sqlEngine";
+import { executeSQL, translateOracleSql, substituteSysdate, transformDateArithmetic, splitStatements } from "./sqlEngine";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -119,6 +119,64 @@ function assignVariable(
   } else {
     variables.set(upper, { name: upper, type: declaredType.toUpperCase(), value: finalValue });
   }
+}
+
+/**
+ * Normalizes user input quotes for dynamic SQL.
+ */
+function normalizeQuotes(sql: string): string {
+  return sql
+    .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'") // single smart quotes → '
+    .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"') // double smart quotes → "
+}
+
+/**
+ * Splits PL/SQL code into statements, respecting nested blocks (BEGIN, IF, FOR, CASE).
+ */
+function splitPlsqlStatements(code: string): string[] {
+  const statements: string[] = [];
+  let current = "";
+  let inSingleQuote = false;
+  let depth = 0;
+  
+  const normalized = code.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  
+  for (let i = 0; i < normalized.length; i++) {
+    const ch = normalized[i];
+    
+    if (ch === "'" && (i === 0 || normalized[i - 1] !== "'")) {
+      inSingleQuote = !inSingleQuote;
+    }
+    
+    if (!inSingleQuote) {
+      const sub = normalized.substring(i).toUpperCase();
+      if (/^(BEGIN|IF\s|CASE\s|LOOP\b)/i.test(sub)) {
+        depth++;
+      } else if (/^(END IF|END LOOP|END CASE)\b/i.test(sub)) {
+        depth--;
+        // Skip ahead to avoid double counting 'END' in 'END IF'
+        const match = sub.match(/^(END IF|END LOOP|END CASE)/i);
+        if (match) {
+          current += normalized.substring(i, i + match[0].length);
+          i += match[0].length - 1;
+          continue;
+        }
+      } else if (/^END\b/i.test(sub) && !/^(END IF|END LOOP|END CASE)\b/i.test(sub)) {
+        depth--;
+      }
+    }
+    
+    if (ch === ";" && !inSingleQuote && depth <= 0) {
+      if (current.trim()) statements.push(current.trim());
+      current = "";
+      depth = 0; // reset safety
+    } else {
+      current += ch;
+    }
+  }
+  
+  if (current.trim()) statements.push(current.trim());
+  return statements;
 }
 
 /**
@@ -484,24 +542,45 @@ function findOperator(expr: string, op: string): number {
  * Collects lines between start and a matching END keyword.
  * Handles nested BEGIN..END blocks.
  */
+/**
+ * Collects lines between start and a matching END keyword.
+ * Handles nested BEGIN..END, IF..END IF, LOOP..END LOOP, and CASE..END CASE blocks.
+ */
 function collectBlock(lines: string[], startIdx: number, endKeyword: RegExp): { blockLines: string[]; endIdx: number } {
   const blockLines: string[] = [];
   let depth = 0;
   let i = startIdx;
+
+  const firstLine = lines[startIdx].trim().toUpperCase();
+  const isBegin = /^BEGIN\b/i.test(firstLine);
+  const isIf = /^IF\b/i.test(firstLine);
+  const isLoop = /\bLOOP\b/i.test(firstLine);
+  const isCase = /^CASE\b/i.test(firstLine);
+
   while (i < lines.length) {
     const line = lines[i].trim().toUpperCase();
-    if (/^BEGIN\b/.test(line)) depth++;
-    if (/^END\s*;?\s*$/.test(line) || endKeyword.test(line)) {
-      if (depth > 0) {
-        depth--;
-        if (depth < 0) break;
-        blockLines.push(lines[i]);
-      } else {
-        break;
+    
+    if (i > startIdx) {
+      const upper = line.toUpperCase();
+      // Block starters increase depth
+      if (/^(BEGIN|IF\b|CASE\b|LOOP\b)/i.test(upper)) {
+        depth++;
       }
-    } else {
-      blockLines.push(lines[i]);
+      
+      // Block enders decrease depth if they DON'T match the sought endKeyword
+      if (endKeyword.test(upper)) {
+        if (depth > 0) {
+          depth--;
+        } else {
+          break; // Found the matching END
+        }
+      } else if (/^(END IF|END LOOP|END CASE|END\b)/i.test(upper)) {
+        // Any other END markers decrement depth
+        if (depth > 0) depth--;
+      }
     }
+    
+    blockLines.push(lines[i]);
     i++;
   }
   return { blockLines, endIdx: i };
@@ -669,6 +748,170 @@ function parseDeclareSection(lines: string[], ctx: ExecutionContext) {
   }
 }
 
+// ── Part 1 Handlers ───────────────────────────────────────────────────
+
+function executeImmediate(stmt: string, ctx: ExecutionContext): void {
+  const match = stmt.match(/EXECUTE\s+IMMEDIATE\s+([\s\S]+)/i);
+  if (!match) throw new Error("Invalid EXECUTE IMMEDIATE syntax");
+
+  let sqlExpr = match[1].trim();
+  if (sqlExpr.endsWith(";")) sqlExpr = sqlExpr.slice(0, -1).trim();
+
+  const sql = resolveStringExpression(sqlExpr, ctx);
+  let finalSql = normalizeQuotes(sql);
+  finalSql = substituteSysdate(finalSql);
+  finalSql = transformDateArithmetic(finalSql);
+  finalSql = substituteContextVariables(finalSql, ctx);
+
+  try {
+    ctx.db.run(translateOracleSql(finalSql));
+    const rows = ctx.db.getRowsModified();
+    ctx.setVar("SQL%ROWCOUNT", rows);
+    ctx.setVar("SQL%FOUND", rows > 0);
+    ctx.setVar("SQL%NOTFOUND", rows === 0);
+  } catch (err: any) {
+    throw new Error(`EXECUTE IMMEDIATE failed: ${err.message}`);
+  }
+}
+
+function executeNestedBlock(stmt: string, ctx: ExecutionContext): void {
+  const exceptionMatch = stmt.match(/BEGIN\s+([\s\S]+?)\s+EXCEPTION\s+([\s\S]+?)\s+END/i);
+  if (!exceptionMatch) return;
+
+  const bodyPart = exceptionMatch[1];
+  const exceptionPart = exceptionMatch[2];
+
+  try {
+    const stmts = splitPlsqlStatements(bodyPart);
+    for (const s of stmts) {
+      if (s.trim()) executePlsqlStatement(s.trim(), ctx);
+    }
+  } catch (err: any) {
+    if (/WHEN\s+OTHERS\s+THEN\s+NULL/i.test(exceptionPart)) {
+      return;
+    }
+    const dbmsMatch = exceptionPart.match(/WHEN\s+OTHERS\s+THEN\s+DBMS_OUTPUT\.PUT_LINE\s*\((.+?)\)/i);
+    if (dbmsMatch) {
+      ctx.dbmsOutput.push(resolveStringExpression(dbmsMatch[1], ctx));
+      return;
+    }
+    throw err;
+  }
+}
+
+function executeInlineSelectForLoop(
+  recordVar: string,
+  selectSql: string,
+  loopBody: string,
+  ctx: ExecutionContext
+): void {
+  let sql = selectSql.trim();
+  sql = substituteContextVariables(sql, ctx);
+  sql = substituteSysdate(sql);
+  sql = transformDateArithmetic(sql);
+
+  let rows: any[] = [];
+  try {
+    const result = ctx.db.exec(translateOracleSql(sql));
+    if (result.length > 0) {
+      const columns = result[0].columns;
+      rows = result[0].values.map((row: any[]) => {
+        const obj: Record<string, any> = {};
+        columns.forEach((col: string, i: number) => {
+          obj[col] = row[i];
+          obj[col.toLowerCase()] = row[i];
+          obj[col.toUpperCase()] = row[i];
+        });
+        return obj;
+      });
+    }
+  } catch (err) {
+    throw new Error(`Inline SELECT failed: ${err}`);
+  }
+
+  for (const row of rows) {
+    ctx.setVar(recordVar, row);
+    ctx.setVar(recordVar.toUpperCase(), row);
+    Object.keys(row).forEach(col => {
+      ctx.setVar(`${recordVar}.${col}`, row[col]);
+      ctx.setVar(`${recordVar}.${col.toUpperCase()}`, row[col]);
+      ctx.setVar(`${recordVar.toUpperCase()}.${col.toUpperCase()}`, row[col]);
+    });
+
+    const bodyStatements = splitPlsqlStatements(loopBody);
+    for (const stmt of bodyStatements) {
+      if (stmt.trim()) executePlsqlStatement(stmt.trim(), ctx);
+    }
+  }
+}
+
+function executePlsqlStatement(stmt: string, ctx: ExecutionContext): void {
+  const line = stmt.trim();
+  const upper = line.toUpperCase();
+
+  // 1. Nested BEGIN...EXCEPTION...END block
+  if (/^BEGIN\s+/i.test(line) && /EXCEPTION/i.test(line)) {
+    executeNestedBlock(line, ctx);
+    return;
+  }
+
+  // 2. EXECUTE IMMEDIATE
+  if (/^EXECUTE\s+IMMEDIATE/i.test(line)) {
+    executeImmediate(line, ctx);
+    return;
+  }
+
+  // 3. FOR rec IN (SELECT...) LOOP inline
+  const inlineMatch = line.match(/^FOR\s+(\w+)\s+IN\s+\(([\s\S]*)\)\s+LOOP([\s\S]*)END\s+LOOP/i);
+  if (inlineMatch) {
+    executeInlineSelectForLoop(inlineMatch[1], inlineMatch[2], inlineMatch[3], ctx);
+    return;
+  }
+
+  // 4. FOR rec IN cursor_name LOOP named cursor
+  const cursorMatchGroup = line.match(/^FOR\s+(\w+)\s+IN\s+(\w+)\s+LOOP([\s\S]*)END\s+LOOP/i);
+  if (cursorMatchGroup) {
+     // Use the existing executeCursorForLoop logic but adapted for this string dispatcher
+     const lines = stmt.split("\n");
+     const match = upper.match(/^FOR\s+(\w+)\s+IN\s+(\w+)\s+LOOP/i);
+     if (match) executeCursorForLoop(lines, 0, match as any, ctx);
+     return;
+  }
+
+  // 5. DBMS_OUTPUT.PUT_LINE
+  const putLineMatch = line.match(/^DBMS_OUTPUT\.PUT_LINE\s*\(([\s\S]*)\)$/i);
+  if (putLineMatch) {
+    ctx.dbmsOutput.push(resolveStringExpression(putLineMatch[1], ctx));
+    return;
+  }
+
+  // 6. IF/ELSIF/ELSE
+  if (upper.startsWith("IF ")) {
+    executeIf(stmt.split("\n"), 0, ctx);
+    return;
+  }
+
+  // 7. Regular DML / Assignment
+  const assignMatch = line.match(/^(\w+)\s*:=\s*([\s\S]+)$/i);
+  if (assignMatch && ctx.hasVar(assignMatch[1])) {
+    ctx.setVar(assignMatch[1], evaluateExpression(assignMatch[2], ctx));
+    return;
+  }
+
+  // Pass through remaining DML/DDL to basic logic
+  if (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE") || 
+      upper.startsWith("CREATE") || upper.startsWith("DROP") || upper.startsWith("ALTER") || upper.startsWith("SELECT")) {
+     const sql = substituteContextVariables(line, ctx);
+     ctx.db.run(translateOracleSql(sql));
+     const rows = ctx.db.getRowsModified();
+     ctx.setVar("SQL%ROWCOUNT", rows);
+     ctx.setVar("SQL%FOUND", rows > 0);
+     ctx.setVar("SQL%NOTFOUND", rows === 0);
+     return;
+  }
+}
+
+
 // ── Statement Executor ─────────────────────────────────────────────────
 
 /**
@@ -694,46 +937,65 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
       continue;
     }
 
-    // ── BEGIN EXECUTE IMMEDIATE ... EXCEPTION WHEN OTHERS THEN NULL; END ──
-    // Common Oracle pattern used for conditional DROP statements.
-    const guardedImmediateMatch = line.match(
-      /^BEGIN\s+EXECUTE\s+IMMEDIATE\s+([\s\S]+?)\s*;\s*EXCEPTION\s+WHEN\s+OTHERS\s+THEN\s+NULL\s*;\s*END$/i
-    );
-    if (guardedImmediateMatch) {
-      try {
-        const dynamicSql = evaluateExpression(guardedImmediateMatch[1], ctx);
-        if (typeof dynamicSql === "string" && dynamicSql.trim()) {
-          ctx.db.run(translateOracleSql(dynamicSql.trim()));
-        }
-      } catch {
-        // Intentionally swallow errors to mimic WHEN OTHERS THEN NULL
+    // 1. Nested BEGIN...EXCEPTION...END block or multi-line BEGIN
+    if (upper === "BEGIN" || upper.startsWith("BEGIN ")) {
+      const { blockLines, endIdx } = collectBlock(lines, i, /END\s*;?/i);
+      const fullBlock = blockLines.join("\n") + "\n" + lines[endIdx];
+      if (/EXCEPTION/i.test(fullBlock)) {
+        executeNestedBlock(fullBlock, ctx);
+      } else {
+        // Fall through to standard block execution line-by-line
+        i++;
+        continue;
       }
+      i = endIdx + 1;
+      continue;
+    }
+
+    // 2. EXECUTE IMMEDIATE
+    if (/^EXECUTE\s+IMMEDIATE/i.test(line)) {
+      executeImmediate(line, ctx);
       i++;
       continue;
     }
 
-    // ── EXECUTE IMMEDIATE ──
-    const executeImmediateMatch = line.match(/^EXECUTE\s+IMMEDIATE\s+([\s\S]+)$/i);
-    if (executeImmediateMatch) {
-      const dynamicSql = evaluateExpression(executeImmediateMatch[1], ctx);
-      const sqlText = String(dynamicSql ?? "").trim();
-      if (sqlText) {
-        try {
-          ctx.db.run(translateOracleSql(sqlText));
-          const rows = ctx.db.getRowsModified();
-          ctx.setVar("SQL%ROWCOUNT", rows);
-          ctx.setVar("SQL%FOUND", rows > 0);
-          ctx.setVar("SQL%NOTFOUND", rows === 0);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          throw new Error(`Line ${currentLineNo}: ${toOracleErrorText(msg)}`);
-        }
-      }
-      i++;
+    // 3. FOR rec IN (SELECT...) LOOP inline
+    const inlineSelectMatch = line.match(/^FOR\s+(\w+)\s+IN\s+\(\s*SELECT/i);
+    if (inlineSelectMatch) {
+       const { blockLines, endIdx } = collectBlock(lines, i, /^END\s+LOOP\s*;?\s*$/i);
+       // Re-match the full header to get record name and query
+       const header = lines[i].trim();
+       const m = header.match(/^FOR\s+(\w+)\s+IN\s+\(([\s\S]*)\)\s+LOOP$/i);
+       if (m) {
+         executeInlineSelectForLoop(m[1], m[2], blockLines.join("\n"), ctx);
+       } else {
+         // Multi-line header case
+         const firstLineMatch = header.match(/^FOR\s+(\w+)\s+IN\s+\(/i);
+         if (firstLineMatch) {
+            // Find the LOOP line
+            let loopIdx = i;
+            while (loopIdx < lines.length && !lines[loopIdx].trim().toUpperCase().endsWith("LOOP")) loopIdx++;
+            const fullHeader = lines.slice(i, loopIdx + 1).join(" ");
+            const innerMatch = fullHeader.match(/^FOR\s+(\w+)\s+IN\s+\(([\s\S]*)\)\s+LOOP$/i);
+            if (innerMatch) {
+                // Adjust body if header spans multiple lines
+                const bodyLinesForLoop = lines.slice(loopIdx + 1, endIdx);
+                executeInlineSelectForLoop(innerMatch[1], innerMatch[2], bodyLinesForLoop.join("\n"), ctx);
+            }
+         }
+       }
+       i = endIdx + 1;
+       continue;
+    }
+
+    // 4. FOR rec IN cursor_name LOOP named cursor
+    const cursorForMatch = upper.match(/^FOR\s+(\w+)\s+IN\s+(\w+)\s+LOOP$/i);
+    if (cursorForMatch) {
+      i = executeCursorForLoop(lines, i, cursorForMatch, ctx);
       continue;
     }
 
-    // ── DBMS_OUTPUT.PUT_LINE ──
+    // 5. DBMS_OUTPUT.PUT_LINE
     const putLineMatch = line.match(/^DBMS_OUTPUT\.PUT_LINE\s*\(([\s\S]*)\)$/i);
     if (putLineMatch) {
       const val = resolveStringExpression(putLineMatch[1], ctx);
@@ -742,29 +1004,21 @@ function executeBody(lines: string[], ctx: ExecutionContext, lineNumbers?: numbe
       continue;
     }
 
+    // 6. IF/ELSIF/ELSE
+    if (upper.startsWith("IF ") || upper === "IF") {
+      i = executeIf(lines, i, ctx);
+      continue;
+    }
+
+    // 7. Regular DML / Variable assignment / Logic
+    // Continue with existing handlers...
+
     // ── Variable assignment: v_name := expr ──
     const assignMatch = line.match(/^(\w+)\s*:=\s*([\s\S]+)$/i);
     if (assignMatch && ctx.hasVar(assignMatch[1])) {
       const val = evaluateExpression(assignMatch[2], ctx);
       ctx.setVar(assignMatch[1], val);
       i++;
-      continue;
-    }
-
-    // ── IF / ELSIF / ELSE / END IF ──
-    if (upper.startsWith("IF ") || upper === "IF") {
-      i = executeIf(lines, i, ctx);
-      continue;
-    }
-
-    // ── FOR loop (Numeric or Cursor) ──
-    const forMatch = upper.match(/^FOR\s+(\w+)\s+IN\s+(REVERSE\s+)?(.+?)\.\.(.+?)\s+LOOP$/i);
-    const cursorForMatch = upper.match(/^FOR\s+(\w+)\s+IN\s+(\w+)\s+LOOP$/i);
-    if (forMatch) {
-      i = executeForLoop(lines, i, forMatch, ctx);
-      continue;
-    } else if (cursorForMatch) {
-      i = executeCursorForLoop(lines, i, cursorForMatch, ctx);
       continue;
     }
 

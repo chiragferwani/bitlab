@@ -160,7 +160,7 @@ function classifyStatement(sql: string): string {
  * Splits SQL code into individual statements by semicolons.
  * Ignores semicolons inside single/double quoted strings and BEGIN...END blocks.
  */
-function splitStatements(code: string): ParsedStatement[] {
+export function splitStatements(code: string): ParsedStatement[] {
   const normalized = normalizeSqlText(code);
   const statements: ParsedStatement[] = [];
   let current = "";

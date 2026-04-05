@@ -4,6 +4,7 @@ import LandingPage from "./pages/LandingPage";
 import BitLab, { type Session } from "./pages/BitLab";
 import VideoLoader from "./components/VideoLoader";
 import { initDatabase, createDatabase, introspectSchema } from "./lib/database";
+import { MongoEngine } from "./lib/mongoEngine";
 
 const App = () => {
   const [loading, setLoading] = useState(true);
@@ -17,6 +18,7 @@ const App = () => {
   const dbMapRef = useRef<Map<string, Database>>(new Map());
   const procsMapRef = useRef<Map<string, Map<string, any>>>(new Map());
   const databaseNameMapRef = useRef<Map<string, string>>(new Map());
+  const mongoMapRef = useRef<Map<string, MongoEngine>>(new Map());
 
   // Start sql.js initialization immediately — before user even clicks Get Started
   useEffect(() => {
@@ -32,6 +34,7 @@ const App = () => {
         dbMapRef.current.set(defaultId, db);
         procsMapRef.current.set(defaultId, new Map());
         databaseNameMapRef.current.set(defaultId, "session");
+        mongoMapRef.current.set(defaultId, new MongoEngine());
         setSessions([{ id: defaultId, name: "query_01.sql", code: "", mode: "SQL" }]);
         setActiveId(defaultId);
         setDbReady(true);
@@ -64,6 +67,7 @@ const App = () => {
               dbMapRef={dbMapRef}
               procsMapRef={procsMapRef}
               databaseNameMapRef={databaseNameMapRef}
+              mongoMapRef={mongoMapRef}
               introspectSchema={introspectSchema}
             />
           </div>
